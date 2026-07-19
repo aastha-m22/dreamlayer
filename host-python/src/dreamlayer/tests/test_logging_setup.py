@@ -29,9 +29,36 @@ class TestJsonFormatter:
         assert obj["logger"] == "dreamlayer.test"
         assert obj["seam"] == "cloud"       # extras ride alongside
 
-    def test_non_serialisable_extra_is_repr(self):
+    def test_non_serialisable_extra_is_type_marker(self):
+        # A non-serialisable value is emitted as a type-only marker, never its
+        # raw repr — repr can carry PII the key-based redaction can't reach.
         obj = json.loads(JsonLineFormatter().format(_record(obj=object())))
-        assert "object object" in obj["obj"]
+        assert obj["obj"] == "<unserialised:object>"
+
+    def test_opaque_object_repr_pii_does_not_leak(self):
+        # extra={"result": <object whose repr embeds a name/transcript>} must NOT
+        # leak that repr. The old json.dumps(raw)→repr(raw) fallback skipped
+        # redaction; now the sanitiser replaces it with a type marker.
+        # FAILS ON REVERT of the sanitize-first change (refute 2026-07-17).
+        class _Rec:
+            def __repr__(self):
+                return "Rec(name='Alice Smith', transcript='meet me at 5 at home')"
+        obj = json.loads(JsonLineFormatter().format(_record(result=_Rec())))
+        scrubbed = json.dumps({k: v for k, v in obj.items() if k != "ts"})
+        assert "Alice Smith" not in scrubbed and "meet me at 5" not in scrubbed
+        assert obj["result"] == "<unserialised:_Rec>"
+
+    def test_sensitive_sibling_survives_a_non_serialisable_leaf(self):
+        # A dict carrying a sensitive key AND a non-serialisable leaf: the leaf
+        # made json.dumps(raw) throw so the WHOLE dict fell to repr(raw),
+        # leaking the sensitive sibling the sanitiser WOULD have redacted. Now
+        # the sibling is redacted and only the leaf is marked (refute 2026-07-17).
+        obj = json.loads(JsonLineFormatter().format(_record(
+            result={"name": "Bob Jones", "raw": object()})))
+        scrubbed = json.dumps({k: v for k, v in obj.items() if k != "ts"})
+        assert "Bob Jones" not in scrubbed
+        assert obj["result"]["name"].startswith("<redacted")
+        assert obj["result"]["raw"] == "<unserialised:object>"
 
     def test_exception_included(self):
         try:
@@ -75,6 +102,26 @@ class TestJsonFormatter:
         assert isinstance(obj["embedding"], str)
         assert obj["embedding"].startswith("<redacted")
         # Non-sensitive extras ride through untouched.
+        assert obj["seam"] == "cloud"
+
+    def test_reply_is_redacted(self):
+        """Regression (privacy): a Juno/API-brain answer passed as
+        extra={"reply": ...} is attacker-influenceable free text and must be
+        redacted, both at the top level and nested under a benign key
+        (extra={"result": {"reply": ...}}). Benign siblings still ride through.
+        FAILS ON REVERT of the ``reply`` sensitive key in logging_setup."""
+        obj = json.loads(JsonLineFormatter().format(_record(
+            "answered",
+            reply="secret answer",                  # top-level Juno answer
+            result={"reply": "nested secret", "ok": True},  # nested answer
+            seam="cloud",                            # benign, must survive
+        )))
+        scrubbed = json.dumps({k: v for k, v in obj.items() if k != "ts"})
+        assert "secret answer" not in scrubbed
+        assert "nested secret" not in scrubbed
+        assert obj["reply"].startswith("<redacted")
+        assert obj["result"]["reply"].startswith("<redacted")
+        assert obj["result"]["ok"] is True           # benign nested key survives
         assert obj["seam"] == "cloud"
 
 

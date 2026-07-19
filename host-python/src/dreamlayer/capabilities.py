@@ -142,6 +142,7 @@ CAPABILITIES: Tuple[Cap, ...] = (
     Cap("nlp", "NER + dependency parse for commitments", "intelligence",
         ("spacy",), "intelligence",
         "orchestrator/commitment_nlp.py, social_lens/ner_spacy.py",
+        note="`dreamlayer setup models` downloads the spaCy model this needs",
         gain="baseline pulls names/promises with regex that breaks on real sentences; this parses them properly", impact=5),
     Cap("online_learning", "Per-user adaptation in real time", "intelligence",
         ("river",), "intelligence",
@@ -193,7 +194,8 @@ CAPABILITIES: Tuple[Cap, ...] = (
     # --- privacy ------------------------------------------------------------------------
     Cap("pii_redaction", "ML PII scrubbing before any write", "privacy",
         ("presidio_analyzer",), "privacy", "memory/pii_presidio.py",
-        note="regex fallback is always on",
+        note="regex fallback is always on; `dreamlayer setup models` downloads the "
+             "spaCy model that activates the presidio path",
         gain="baseline scrubs emails/phones by regex; this catches names, addresses, cards in context", impact=4),
     Cap("asym_signing", "Ed25519 provenance signatures", "privacy",
         ("cryptography",), "privacy", "reality_compiler/sign_crypto.py",
@@ -203,6 +205,15 @@ CAPABILITIES: Tuple[Cap, ...] = (
         ("anyio",), "privacy", "orchestrator/concurrency_anyio.py",
         note="asyncio fallback is always on",
         gain="baseline cancel-all is hand-rolled asyncio; this makes the Veil-stop guarantee structural", impact=2),
+    Cap("stranger_defense", "Never identify a stranger (name NER)", "privacy",
+        ("presidio_analyzer",), "privacy", "object_lens/person_guard.py",
+        note="deterministic name-shape + person-word guard is ALWAYS on; "
+             "`dreamlayer setup models` activates the presidio NER layer; the "
+             "visual person-detect backstop rides the vision pack (ultralytics)",
+        gain="baseline defers a person by name-shape and a person-word list; this "
+             "adds Presidio NER for a lone or odd-cased given name the shape rule "
+             "misses, and (with the vision pack) a YOLO backstop for a human the "
+             "VLM mislabels as an object", impact=3),
 
     # --- platform ----------------------------------------------------------------------
     Cap("plugin_entrypoints", "Plugins distributed as pip packages", "platform",
@@ -230,6 +241,19 @@ CAPABILITIES: Tuple[Cap, ...] = (
     Cap("mlx_train", "Overnight LoRA fine-tune of the local model", "platform",
         ("mlx",), "platform", "rem/nightly_mlx.py", kind="darwin",
         gain="baseline model never adapts; this fine-tunes it overnight on your own memories", impact=4),
+
+    # --- on-device speech (one ONNX engine behind the voice seams) ---------------
+    Cap("onnx_speech", "Unified on-device speech engine (ASR + VAD + speaker + KWS)", "voice",
+        ("sherpa_onnx",), "voice", "orchestrator/sherpa_backend.py",
+        gain="baseline wires each voice seam to a separate model; this is one fast ONNX engine covering transcription, voice detection, speaker id and keyword spotting on-device", impact=4),
+
+    # --- plugin isolation + cross-device sync ------------------------------------
+    Cap("wasm_plugins", "In-process capability-enforced WASM plugin host", "platform",
+        ("wasmtime",), "platform", "plugins/wasm_component_host.py",
+        gain="baseline isolates an untrusted plugin in a subprocess; this runs a WASM guest in-process with ZERO ambient authority — it can only call the host functions its declared capabilities link", impact=4),
+    Cap("crdt_sync", "Conflict-free repertoire sync across your devices", "sync",
+        ("loro",), "sync", "reality_compiler/v2/vault_sync.py",
+        gain="baseline keeps your Figments and memory on one device; this syncs them peer-to-peer across your devices — no server, no conflicts (a loro CRDT)", impact=3),
 
     # --- external runtimes (spoken to over HTTP; nothing to pip-import) -----------------
     Cap("ollama_local", "Local chat/vision/embeddings via Ollama", "services",
@@ -354,8 +378,8 @@ PACKS: Tuple[Pack, ...] = (
          "Deeper privacy and provenance: in-context PII scrubbing, Ed25519 signatures, structured cancellation.",
          ("privacy", "structured"), "~300 MB", 3),
     Pack("operator", "Operator",
-         "Operations polish: LAN auto-discovery, live dashboards, provider routing, pip-installable plugins.",
-         ("infra", "llm", "platform"), "~200 MB", 2),
+         "Operations polish: LAN auto-discovery, live dashboards, provider routing, pip-installable plugins, and conflict-free repertoire sync across your devices.",
+         ("infra", "llm", "platform", "sync"), "~200 MB", 2),
 )
 
 _PACK_BY_KEY = {p.key: p for p in PACKS}

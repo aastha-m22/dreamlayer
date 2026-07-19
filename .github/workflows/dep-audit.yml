@@ -3,8 +3,15 @@ name: dependency-audit
 # Supply-chain gate (audit 2026-07-14): the repo had NO automated CVE scanning,
 # while ~50 optional deps (including security-critical `cryptography`) were
 # declared as unpinned names. pip-audit flags known-vulnerable resolved
-# versions. Runs on PRs touching deps and weekly, so a newly-disclosed CVE
-# surfaces even with no code change.
+# versions, and the license gate below fails strong-copyleft in the shipped
+# surface. Runs on PRs that change the dependency set.
+#
+# The weekly cron was dropped (2026-07-18) to stop double-paying for CVE
+# scanning: Dependabot security alerts already scan the EXISTING pinned deps
+# continuously and open a fix PR when a new advisory lands, and
+# dependency-review guards the PR-time dependency diff — so the
+# newly-disclosed-CVE-against-unchanged-code case stays covered without a
+# redundant scheduled scan here.
 
 on:
   push:
@@ -16,8 +23,9 @@ on:
     paths:
       - "host-python/pyproject.toml"
       - "host-python/uv.lock"
-  schedule:
-    - cron: "0 6 * * 1"      # Mondays 06:00 UTC
+
+permissions:
+  contents: read   # least-privilege floor; jobs opt into more where needed
 
 jobs:
   pip-audit:
@@ -26,14 +34,14 @@ jobs:
     # network, HTTP server) was scanned clean at introduction, so a red check
     # here means a newly-resolved dependency version carries a known advisory.
     # It only runs on PRs that change the dependency set (see `on.pull_request.
-    # paths`) plus a weekly cron, so it blocks exactly the changes that can
-    # introduce a vulnerable version.
+    # paths`), so it blocks exactly the changes that can introduce a vulnerable
+    # version; Dependabot covers advisories that land against unchanged deps.
     defaults:
       run:
         working-directory: host-python
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
       - name: Install the security-relevant dependency surface
@@ -64,3 +72,68 @@ jobs:
           # any distribution can't be audited — which our own editable package
           # always trips. Every third-party dependency is still fully scanned.
           pip-audit --skip-editable --progress-spinner=off
+
+      - name: License gate — no strong-copyleft in the security-critical surface
+        run: |
+          # A CVE gate says nothing about LICENSES. A dep that quietly resolves to
+          # a GPL/AGPL version would obligate the proprietary app to copyleft — a
+          # risk pip-audit can't see. This fails the build if a strong-copyleft
+          # (GPL/AGPL) license appears in the INSTALLED surface scanned by this job
+          # (the crypto/PII/LLM/server deps installed above — NOT the whole shipped
+          # tree; the heavy vision/ML extras aren't installed here, see below).
+          # LGPL (weak copyleft, dynamic linking) is allowed, matching
+          # dependency-review.yml. Known, reviewed exceptions are acknowledged
+          # explicitly rather than hidden.
+          #
+          # KNOWN: the optional `vision` extra ships ultralytics (YOLO) under
+          # AGPL-3.0. It is not installed in this job, so it is not scanned here;
+          # its AGPL status is tracked in SECURITY.md (a proprietary distribution
+          # needs an Ultralytics commercial license or AGPL compliance).
+          pip install pip-licenses
+          pip-licenses --format=json > licenses.json
+          python - <<'PY'
+          import json, sys
+          # TRUE build/CI tooling only (never distributed). Runtime deps like
+          # pluggy/packaging are intentionally NOT here — they get scanned.
+          IGNORE = {"pip", "pip-audit", "pip-licenses", "setuptools", "wheel",
+                    "ruff", "mypy", "pytest", "pytest-cov", "coverage",
+                    "prettytable", "wcwidth", "cyclonedx-python-lib"}
+          # Explicitly acknowledged copyleft (reviewed, tracked) — reported, not failed.
+          ACK = {"ultralytics"}
+
+          def is_strong_copyleft(lic: str) -> bool:
+              lic = lic.lower()
+              if "lgpl" in lic or "lesser general public" in lic:
+                  return False                       # weak copyleft — allowed
+              if "with" in lic and "exception" in lic:
+                  return False                       # e.g. GPL WITH Classpath-exception
+              # a dual license "MIT OR GPL-3.0" is usable via the permissive half
+              alts = [a.strip() for a in lic.replace(" / ", " or ").split(" or ")]
+              def alt_is_copyleft(a):
+                  return ("gpl" in a or "agpl" in a or "affero" in a
+                          or "general public license" in a)
+              return all(alt_is_copyleft(a) for a in alts if a)
+
+          bad, unknown, ack = [], [], []
+          for pkg in json.load(open("licenses.json")):
+              name = pkg.get("Name", "")
+              lic = (pkg.get("License") or "").strip()
+              if name.lower() in IGNORE:
+                  continue
+              if not lic or lic.upper() == "UNKNOWN":
+                  unknown.append(name)               # visible, but not a hard fail
+                  continue
+              if is_strong_copyleft(lic):
+                  (ack if name.lower() in ACK else bad).append((name, lic))
+          if ack:
+              print("Acknowledged copyleft (tracked, allowed):")
+              for n, l in ack: print(f"  {n}: {l}")
+          if unknown:
+              print(f"::warning::{len(unknown)} package(s) with UNKNOWN license "
+                    f"(review): {', '.join(sorted(unknown)[:20])}")
+          if bad:
+              print("FAIL: strong-copyleft (GPL/AGPL) licenses in the scanned surface:")
+              for n, l in bad: print(f"  {n}: {l}")
+              sys.exit(1)
+          print("License gate: no un-acknowledged strong-copyleft (GPL/AGPL) dependencies")
+          PY

@@ -5,8 +5,12 @@ Incognito gate on URL feeds, and the platform-honest panel copy.
 """
 from __future__ import annotations
 
+import http.server
+import threading
 import time
 from email.message import EmailMessage
+
+import pytest
 
 from dreamlayer.ai_brain.server import windows_sources as ws
 from dreamlayer.ai_brain.server.store import BrainConfig
@@ -52,6 +56,27 @@ class TestParseMbox:
     def test_garbage_is_empty(self):
         assert ws.parse_mbox(b"") == []
         assert ws.parse_mbox(b"no separators at all") == []
+
+
+class TestSourceParsersAreCrashSafe:
+    def test_body_text_survives_a_bogus_charset(self):
+        # An attacker-declared charset the codec registry doesn't know must NOT
+        # raise LookupError (errors='ignore' can't rescue a bad codec NAME). One
+        # such email otherwise blacks out the whole mail feed (refute 2026-07-18).
+        import email
+        msg = email.message_from_bytes(
+            b"Content-Type: text/plain; charset=\"cp-does-not-exist\"\r\n\r\n"
+            b"hello there\r\n")
+        assert "hello there" in ws._body_text(msg)      # must not raise
+
+    def test_parse_ics_dt_tolerates_mktime_overflow(self, monkeypatch):
+        # time.mktime raises OverflowError/OSError for an out-of-range date on
+        # stricter platforms (Windows more than glibc). The parser must return
+        # None, not let it escape read_calendar_events (refute 2026-07-18).
+        def boom(*_a):
+            raise OverflowError("mktime out of range")
+        monkeypatch.setattr(ws.time, "mktime", boom)
+        assert ws._parse_ics_dt("20260101", "") is None   # must not raise
 
 
 class TestMailDocuments:
@@ -205,6 +230,140 @@ class TestIncognitoNeverFetches:
         (cal / "home.ics").write_text(_ics(name="Home"))
         out = ws.load_ics_sources(BrainConfig(network_mode="lan_only"))
         assert [name for name, _ in out] == ["home"]
+
+    def test_calendars_dir_symlink_escaping_allowlist_is_refused(
+            self, tmp_path, monkeypatch):
+        # A junction/symlink dropped in <state>/calendars that RESOLVES outside
+        # the user's own tree must be refused — the `*.ics` glob lists it, but
+        # every glob result flows through store._is_allowed_root (which
+        # resolve()s), the same default-deny gate that guards calendar_ics file
+        # entries and watched folders (audit 2026-07-17). Revert-failing: drop
+        # the _is_allowed_root check on glob paths and `escape` gets read.
+        import os
+        from dreamlayer.ai_brain.server import store
+        # Narrow the allow-list to `allowed/` so `outside/` is genuinely outside
+        # the user tree (real HOME/tmp on CI both contain pytest's tmp_path).
+        allowed = tmp_path / "allowed"
+        outside = tmp_path / "outside"
+        allowed.mkdir(); outside.mkdir()
+        monkeypatch.setenv("HOME", str(allowed))          # POSIX Path.home()
+        # Path.home() reads USERPROFILE (not HOME) on Windows, so narrow that too
+        # or the escape target — which lives under the real temp/profile tree on
+        # the Windows runner — stays inside the allow-list and the test can't tell
+        # a refused escape from an allowed one (test-windows CI, 2026-07-17).
+        monkeypatch.setenv("USERPROFILE", str(allowed))   # Windows Path.home()
+        monkeypatch.delenv("HOMEDRIVE", raising=False)     # don't let these override
+        monkeypatch.delenv("HOMEPATH", raising=False)
+        monkeypatch.setattr(store.tempfile, "gettempdir", lambda: str(allowed))
+        state = allowed / ".dreamlayer"
+        cal = state / "calendars"; cal.mkdir(parents=True)
+        monkeypatch.setenv("DREAMLAYER_DIR", str(state))
+        # a readable .ics OUTSIDE the allow-list — the symlink's real target
+        secret = outside / "secret.ics"
+        secret.write_text(_ics(_vevent("Exfil", "20260101T000000Z"),
+                               name="Secret"))
+        (cal / "home.ics").write_text(_ics(name="Home"))  # legit, allow-listed
+        try:
+            os.symlink(secret, cal / "escape.ics")        # junction analogue
+        except (OSError, NotImplementedError):
+            import pytest
+            pytest.skip("symlinks unavailable (Windows without privilege)")
+        names = [name for name, _ in ws.load_ics_sources(BrainConfig())]
+        assert "home" in names            # the allow-listed file is still read
+        assert "escape" not in names      # the escaping junction is refused
+
+
+# ---------------------------------------------------------------------------
+# SSRF-via-redirect: the ICS URL fetch must refuse a 3xx bounce to another host
+# (mirrors test_egress_hardening_2026_07_17 — a real in-process HTTP server so
+# the test is honestly red on revert to the redirect-following default opener).
+# ---------------------------------------------------------------------------
+
+class _Quiet(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):            # keep the test run quiet
+        pass
+
+
+def _serve(handler_cls):
+    """Start ``handler_cls`` on a daemon thread; return ``(base_url, shutdown)``."""
+    srv = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address
+    return f"http://{host}:{port}", srv.shutdown
+
+
+class TestIcsUrlFetchRefusesRedirect:
+    @pytest.fixture(autouse=True)
+    def _no_proxy(self, monkeypatch):
+        # urllib must talk straight to 127.0.0.1, never via an ambient proxy.
+        monkeypatch.setenv("no_proxy", "*")
+        monkeypatch.setenv("NO_PROXY", "*")
+
+    def test_fetch_ics_url_does_not_follow_a_302(self):
+        # Revert-failing: the DEFAULT opener follows the 302 to /target (a
+        # different host in the wild — cloud metadata / loopback) and returns its
+        # body; the hardened no_redirect_opener raises HTTPError(302) BEFORE
+        # /target is ever requested. is_local_endpoint (pre-fetch) can't catch
+        # this — it only saw the original public URL.
+        followed = {"hit": False}
+
+        class Redir(_Quiet):
+            def do_GET(self):
+                if self.path == "/target":         # only reached if a bounce is followed
+                    followed["hit"] = True
+                    body = b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+
+        base, shutdown = _serve(Redir)
+        try:
+            with pytest.raises(Exception):
+                ws._fetch_ics_url(base + "/start", timeout=4)
+            assert followed["hit"] is False        # egress never bounced onward
+        finally:
+            shutdown()
+
+    def test_load_ics_sources_skips_a_redirecting_feed(self, tmp_path, monkeypatch):
+        # End to end through the caller: a public-looking https feed clears the
+        # pre-fetch https + is_local_endpoint gate (a bare hostname is remote —
+        # no DNS), then the server 302s. The real _fetch_ics_url raises
+        # HTTPError(302), which load_ics_sources' except-continue skips, so the
+        # feed contributes nothing and the redirect target is never fetched.
+        monkeypatch.setenv("DREAMLAYER_DIR", str(tmp_path))
+        followed = {"hit": False}
+
+        class Redir(_Quiet):
+            def do_GET(self):
+                if self.path == "/target":
+                    followed["hit"] = True
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+
+        base, shutdown = _serve(Redir)
+        try:
+            # The config URL LOOKS public (clears the gate); the fetcher routes
+            # through the REAL hardened _fetch_ics_url against the local 302 server
+            # (in production these are the same host — a public feed that bounces).
+            cfg = BrainConfig(network_mode="connected",
+                              calendar_ics=["https://public.example/cal.ics"])
+            out = ws.load_ics_sources(
+                cfg, fetcher=lambda u: ws._fetch_ics_url(base + "/start", timeout=4))
+            assert out == []                       # the redirecting feed is skipped
+            assert followed["hit"] is False        # target never hit
+        finally:
+            shutdown()
 
 
 # ---------------------------------------------------------------------------

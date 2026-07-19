@@ -8,11 +8,24 @@ construction is what's tested — same split as the LaunchAgent plist writer.
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
+from pathlib import Path
 
 import pytest
 
 from dreamlayer.ai_brain import menubar, tray_windows
+
+
+def _load_app_main():
+    """Load packaging/app_main.py by path — it lives outside the importable
+    `dreamlayer` package (mirrors test_appliance_token_entropy)."""
+    path = Path(__file__).resolve().parents[3] / "packaging" / "app_main.py"
+    spec = importlib.util.spec_from_file_location("dl_app_main_lifecycle", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # -- the status dot reuses the menu bar's pure summary --------------------------
@@ -46,6 +59,102 @@ def test_status_lines_are_shared_with_the_mac_menu():
     assert any(line == "Model: keyword" for line in s["lines"])
 
 
+# -- stale-token recovery: a mid-session rotation is picked up, no restart ------
+
+def test_tray_recovers_from_a_rotated_pairing_token(tmp_path):
+    # The tray caches the pairing token and, before this fix, re-read it from
+    # config ONLY while empty (the grey-dot startup-race fix). So once a NON-empty
+    # token was cached it was never re-read for the process lifetime: a mid-session
+    # token ROTATION (the panel "rotate" action mints a new token into
+    # brain_config.json) stranded the UI on the OLD token → every loopback call
+    # 401/403s → a permanent grey dot until restart. The fix: an _api 401/403
+    # clears the cache so the next _token() re-reads the fresh token.
+    import urllib.error
+    from dreamlayer.ai_brain.server.store import BrainConfig
+    cfg = tmp_path / "cfg"; cfg.mkdir()
+    BrainConfig(token="old").save(cfg)
+
+    auth = tray_windows._TokenCache(str(cfg), BrainConfig.load)
+    assert auth.get() == "old"                       # cached the initial token
+
+    # the panel rotates the token: a NEW token is persisted to brain_config.json …
+    BrainConfig(token="new").save(cfg)
+    # … but a non-empty cache still hands out the stale token (the bug's setup):
+    assert auth.get() == "old"
+
+    # an _api call authenticating with the stale token comes back 403
+    class _Opener403:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden",
+                                         {}, None)
+
+    with pytest.raises(urllib.error.HTTPError):
+        tray_windows._authed_api(7777, auth, "/dreamlayer/config", "POST",
+                                 b"{}", opener=_Opener403())
+
+    # the 403 INVALIDATED the cache → the next read recovers the rotated token
+    # WITHOUT a restart. The reverted "re-read only while empty" logic (no
+    # invalidate on auth failure) would stay stuck on "old" and fail here.
+    assert auth.get() == "new"
+
+
+def test_tray_passive_refresh_self_heals_from_a_rotated_token_no_user_action(
+        tmp_path):
+    # THE PASSIVE-PATH GAP (Windows twin): the tray dot is driven by fetch_status
+    # on the loop()/sleep(15) tick, NOT by _authed_api (which only runs on
+    # Sync/Incognito). Before this fix fetch_status swallowed every error and
+    # NEVER touched the token cache, so after a mid-session rotation the passive
+    # tick re-sent the stale cached token forever → the dot stayed grey until the
+    # user clicked something. The fix routes the tray's passive poll through the
+    # auth-aware fetch_status, which invalidates the cache on a 401/403 so the
+    # next tick re-reads the rotated token and the dot recovers on its own.
+    import urllib.error
+    from dreamlayer.ai_brain.server.store import BrainConfig
+    cfg = tmp_path / "cfg"; cfg.mkdir()
+    BrainConfig(token="old").save(cfg)
+    auth = tray_windows._TokenCache(str(cfg), BrainConfig.load)
+    assert auth.get() == "old"                       # cached the initial token
+
+    # the panel rotates the token: config now holds "new", cache still "old"
+    BrainConfig(token="new").save(cfg)
+    assert auth.get() == "old"                        # stale cache hands out old
+
+    class _Resp:
+        def __init__(self, data): self._data = data
+        def read(self): return self._data
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    green = (b'{"model":"ollama","cloud":true,"cloud_ready":true,'
+             b'"stats":{"files":1}}')
+
+    class _RotatingOpener:
+        def __init__(self): self.tokens_seen = []
+        def open(self, req, timeout=None):
+            tok = req.headers.get("X-dreamlayer-token")   # urllib capitalizes
+            self.tokens_seen.append(tok)
+            if tok == "new":
+                return _Resp(green)
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+    opener = _RotatingOpener()
+    # tick 1 — the PASSIVE poll authenticates with the stale token and 403s. It
+    # returns None (grey dot this tick) AND invalidates the cache. No user action.
+    st = tray_windows.fetch_status(7777, auth.get(), auth=auth, opener=opener)
+    assert st is None                                 # grey dot preserved
+
+    # the 403 invalidated the cache → the next read picks up the rotated token …
+    assert auth.get() == "new"
+
+    # tick 2 — the very next passive poll carries "new" and recovers a GREEN dot,
+    # with NO user action taken. The reverted fetch_status (never invalidating)
+    # would keep sending "old", stay 403, and fail this assertion.
+    st2 = tray_windows.fetch_status(7777, auth.get(), auth=auth, opener=opener)
+    assert st2 is not None
+    assert tray_windows.dot_color(menubar.status_summary(st2)) == "#1F8A3D"  # green
+    assert opener.tokens_seen == ["old", "new"]
+
+
 # -- start-at-login: the Run-entry command (pure) -------------------------------
 
 def test_build_login_entry_source_mirrors_the_launch_agent():
@@ -58,7 +167,42 @@ def test_build_login_entry_source_mirrors_the_launch_agent():
     # LaunchAgent (see test_mac_appliance.py).
     assert "--host 0.0.0.0" in cmd
     assert "--port 7778" in cmd
-    assert "--dir" in cmd and "--token rune" in cmd
+    assert "--dir" in cmd
+    # SECURITY (audit 2026-07-17): the pairing token is NEVER on the command
+    # line. An HKCU Run value is readable by any process running as the user, so
+    # `--token <secret>` there leaked the pairing secret registry-/ps-visible.
+    # The launched server reads the token from brain_config.json instead.
+    assert "--token" not in cmd and "rune" not in cmd
+
+
+def test_login_entry_never_embeds_the_pairing_token():
+    # Even when a token is passed, build_login_entry must not emit it — the
+    # command a Run key holds is world-readable to every user-level process.
+    secret = "s3cr3t-pairing-abcdef0123456789"
+    src = tray_windows.build_login_entry(
+        directory=r"C:\Users\me\.dreamlayer", token=secret, port=7778,
+        executable=r"C:\Python311\python.exe", frozen=False)
+    frozen = tray_windows.build_login_entry(
+        directory=r"D:\state", token=secret, port=7778,
+        executable=r"C:\Apps\DreamLayer.exe", frozen=True)
+    for cmd in (src, frozen):
+        assert secret not in cmd
+        assert "--token" not in cmd
+    # …and the source entry still launches the server, which resolves the token
+    # from the on-disk config it points at via --dir.
+    assert "-m dreamlayer.ai_brain.server" in src
+    assert "--dir" in src
+
+
+def test_appliance_resolves_pairing_token_from_on_disk_config(tmp_path):
+    # The other half of the fix: the process the login entry launches reads the
+    # pairing token from brain_config.json (0600-equivalent) — no token needed
+    # on argv. Constructing a Brain over a cfg dir loads exactly the persisted
+    # token, which is what run_tray/the server authenticate with.
+    from dreamlayer.ai_brain.server import Brain
+    from dreamlayer.ai_brain.server.store import BrainConfig
+    BrainConfig(token="persisted-secret").save(tmp_path)
+    assert Brain(tmp_path).config.token == "persisted-secret"
 
 
 def test_build_login_entry_frozen_is_just_the_app():
@@ -122,3 +266,161 @@ def test_main_install_login_declines_off_windows(monkeypatch, capsys):
     assert tray_windows.main(["--install-login"]) == 1
     out = capsys.readouterr().out
     assert "Windows-only" in out and "menubar" in out
+
+
+# -- the "Sync now" toast is honest about what Windows syncs --------------------
+
+def test_windows_sync_toast_names_only_calendar():
+    # Contacts and Reminders are macOS-only; the Windows tray must not claim to
+    # have synced them (the old toast said "calendar, contacts, reminders").
+    assert "calendar" in tray_windows.SYNC_TOAST.lower()
+    assert "contact" not in tray_windows.SYNC_TOAST.lower()
+    assert "reminder" not in tray_windows.SYNC_TOAST.lower()
+    assert tray_windows.SYNC_ENDPOINTS == ("/dreamlayer/calendar/sync",)
+
+
+# -- opt-in "Check for updates" is the shared, offline-safe seam ---------------
+
+def test_tray_reuses_the_update_check_seam():
+    assert tray_windows.check_for_update is menubar.check_for_update
+
+    def fake(url, timeout):
+        import json as _json
+        return _json.dumps({"tag_name": "v9.9.9"}).encode()
+    res = tray_windows.check_for_update(current="0.2.0", fetch_fn=fake)
+    assert res["status"] == "update" and "9.9.9" in res["message"]
+
+
+# -- single-instance guard + server-death surfacing (packaging/app_main.py) ----
+
+def test_single_instance_guard_blocks_a_second_start(tmp_path):
+    app_main = _load_app_main()
+    h1 = app_main.acquire_single_instance_lock(str(tmp_path))
+    assert h1 is not None
+    try:
+        # a 2nd launch can't take the lock → it must back off and exit
+        h2 = app_main.acquire_single_instance_lock(str(tmp_path))
+        assert h2 is None
+    finally:
+        h1.close()
+    # once the first releases, a fresh instance can acquire again
+    h3 = app_main.acquire_single_instance_lock(str(tmp_path))
+    assert h3 is not None
+    h3.close()
+
+
+def test_main_second_instance_exits_0_without_a_second_server(tmp_path, monkeypatch):
+    app_main = _load_app_main()
+    held = app_main.acquire_single_instance_lock(str(tmp_path))    # 1st instance
+    assert held is not None
+    try:
+        started = {"thread": False}
+
+        class _NoThread:
+            def __init__(self, *a, **k):
+                started["thread"] = True
+
+            def start(self):
+                started["thread"] = True
+
+        monkeypatch.setenv("DREAMLAYER_DIR", str(tmp_path))
+        monkeypatch.setattr(app_main.threading, "Thread", _NoThread)
+        monkeypatch.setattr(app_main.webbrowser, "open", lambda *a, **k: True)
+        monkeypatch.setattr(app_main.sys, "argv",
+                            ["dreamlayer", "--dir", str(tmp_path)])
+        rc = app_main.main()
+        assert rc == 0                        # clean exit, not a crash
+        assert started["thread"] is False     # no 2nd _serve thread was created
+    finally:
+        held.close()
+
+
+def test_lock_acquire_raises_on_unwritable_dir_not_returns_none(tmp_path):
+    # Finding B: a create/open failure must be DISTINGUISHABLE from "already
+    # held". The contended case returns None, but an unwritable/inaccessible lock
+    # dir RAISES OSError — so main() can tell them apart instead of mistaking an
+    # unwritable state dir for a second instance.
+    app_main = _load_app_main()
+    afile = tmp_path / "not-a-dir"
+    afile.write_text("x")
+    bad_dir = str(afile / "sub")     # parent is a file → mkdir(parents=True) fails
+    with pytest.raises(OSError):
+        app_main.acquire_single_instance_lock(bad_dir)
+
+
+def test_unwritable_lock_dir_is_not_a_false_already_running(tmp_path, monkeypatch,
+                                                            caplog):
+    # Finding B: an unwritable lock dir must NOT be reported as "already running"
+    # + exit 0 (which would focus a nonexistent instance and mask the failure).
+    # It fails OPEN: log a distinct error and start the server anyway.
+    import logging as _logging
+    app_main = _load_app_main()
+
+    def _boom(lock_dir):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(app_main, "acquire_single_instance_lock", _boom)
+
+    started = {"thread": False}
+
+    class _NoThread:
+        def __init__(self, *a, **k): ...
+        def start(self):
+            started["thread"] = True
+    monkeypatch.setattr(app_main.threading, "Thread", _NoThread)
+    monkeypatch.setattr(app_main, "_wait_ready", lambda *a, **k: True)
+
+    focused = {"called": False}
+    monkeypatch.setattr(app_main, "_focus_existing",
+                        lambda *a, **k: focused.__setitem__("called", True))
+    # stub the UI entrypoints so main() returns without a real menu bar/tray
+    import dreamlayer.ai_brain.menubar as mb
+    import dreamlayer.ai_brain.tray_windows as tw
+    monkeypatch.setattr(mb, "run_menubar", lambda *a, **k: 0)
+    monkeypatch.setattr(tw, "run_tray", lambda *a, **k: 0)
+
+    monkeypatch.setenv("DREAMLAYER_DIR", str(tmp_path))
+    monkeypatch.setattr(app_main.sys, "argv",
+                        ["dreamlayer", "--dir", str(tmp_path)])
+    with caplog.at_level(_logging.ERROR, logger="dreamlayer.appliance"):
+        rc = app_main.main()
+    # Fail-open to running: a server thread WAS started and the "already running"
+    # focus path was NOT taken (that path starts no thread and focuses instead).
+    assert started["thread"] is True
+    assert focused["called"] is False
+    assert rc == 0                          # the UI ran; not a false-already-running
+    # …and a DISTINCT error was logged rather than a silent misclassification.
+    assert any("lock" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_serve_surfaces_a_bind_failure_instead_of_dying_silently(tmp_path, monkeypatch):
+    app_main = _load_app_main()
+    import dreamlayer.ai_brain.server.server as srv
+
+    class _Cfg:
+        token = "t"
+
+    class _FakeBrain:
+        def __init__(self, d):
+            self.config = _Cfg()
+
+        def save(self): ...
+        def start_watching(self): ...
+        def start_brief_scheduler(self): ...
+        def start_calendar_sync(self): ...
+
+    def _boom(brain, host, port):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(srv, "Brain", _FakeBrain)
+    monkeypatch.setattr(srv, "make_brain_server", _boom)
+    status: dict = {}
+    app_main._serve(str(tmp_path), 7777, status)      # must NOT raise
+    assert status.get("error") is not None
+    assert status.get("bound") is None
+
+
+def test_wait_ready_short_circuits_on_server_error():
+    app_main = _load_app_main()
+    status = {"error": OSError("bind failed")}
+    # returns immediately (no network) once the serve thread reports an error
+    assert app_main._wait_ready(7777, status, timeout=1.0) is False

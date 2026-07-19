@@ -53,6 +53,25 @@ _DANGER_CALLS = {
     ("os", "execvp"): "subprocess",
     ("os", "spawnv"): "subprocess",
     ("os", "spawnl"): "subprocess",
+    # the rest of the exec*/spawn* family the table missed — each replaces the
+    # process image or spawns one (curl exfil / arbitrary binary) exactly like
+    # os.system, but a declared-no-subprocess plugin reached them undeclared
+    # (refute 2026-07-17).
+    ("os", "execl"): "subprocess",
+    ("os", "execle"): "subprocess",
+    ("os", "execlp"): "subprocess",
+    ("os", "execlpe"): "subprocess",
+    ("os", "execvpe"): "subprocess",
+    ("os", "spawnle"): "subprocess",
+    ("os", "spawnlp"): "subprocess",
+    ("os", "spawnlpe"): "subprocess",
+    ("os", "spawnve"): "subprocess",
+    ("os", "spawnvp"): "subprocess",
+    ("os", "spawnvpe"): "subprocess",
+    ("os", "posix_spawn"): "subprocess",
+    ("os", "posix_spawnp"): "subprocess",
+    ("pty", "spawn"): "subprocess",
+    ("pty", "fork"): "subprocess",
     ("subprocess", "*"): "subprocess",
     ("socket", "*"): "network",
     ("ctypes", "*"): "subprocess",
@@ -74,6 +93,18 @@ _DANGER_CALLS = {
     ("asyncio", "open_connection"): "network",
     ("asyncio", "open_unix_connection"): "network",
 }
+# asyncio EVENT-LOOP socket openers (loop.create_connection(...)). The loop is
+# usually an unresolved call result — asyncio.new_event_loop().create_connection()
+# — so the module-qualified table above never sees the receiver. These method
+# names are distinctive raw-socket openers; flag them on ANY receiver so a
+# connector can't reach the network through a loop without declaring it. Over-
+# declaration is the safe direction (refute 2026-07-17). ``ssl`` egress
+# (ssl.get_server_certificate opens a TCP socket) is caught via _DANGER_IMPORTS.
+_NET_METHOD_OPENERS = {
+    "create_connection", "create_unix_connection", "sock_connect",
+    "create_datagram_endpoint", "connect_accepted_socket",
+    "create_server", "create_unix_server",
+}
 # modules any of whose attributes reaching a dynamic name (getattr(mod, x)) we
 # can't resolve statically — treated as a sensitive receiver so a dynamic
 # attribute grab can't launder a call past the (module, attr) table.
@@ -90,6 +121,7 @@ _DANGER_IMPORTS = {
     # additional network-egress modules the old table missed, so a plugin could
     # exfiltrate via SMTP/FTP/telnet/websockets without declaring 'network'
     # (audit 2026-07-14).
+    "ssl": "network",   # ssl.get_server_certificate((host,port)) opens a TCP socket
     "smtplib": "network", "ftplib": "network", "telnetlib": "network",
     "websocket": "network", "websockets": "network",
     "httpx": "network", "aiohttp": "network",
@@ -99,7 +131,32 @@ _DANGER_IMPORTS = {
     # (re-audit 2026-07-15).
     "xmlrpc": "network", "poplib": "network", "imaplib": "network",
     "nntplib": "network", "urllib3": "network", "webbrowser": "network",
+    # asyncore/asynchat ARE network I/O frameworks (dispatcher().connect(...))
+    # and their .connect isn't in the method-opener set, so the import is the
+    # honest declaration point (refute 2026-07-17).
+    "asyncore": "network", "asynchat": "network",
     "pickle": None, "marshal": None,
+}
+
+# Full dotted imports whose TOP-LEVEL name is benign but whose submodule is an
+# egress channel — `multiprocessing` is fine, `multiprocessing.connection` is
+# IPC over a socket/pipe (Client((host,port)) dials out). Matched on the whole
+# module path in visit_Import/visit_ImportFrom, so `import
+# multiprocessing.connection`, `from multiprocessing.connection import Client`,
+# and `from multiprocessing import connection` all declare network
+# (refute 2026-07-17).
+_DANGER_IMPORT_PATHS = {
+    "multiprocessing.connection": "network",
+}
+# Distinctive network SINK class names reached as a >=2-level attribute chain
+# (logging.handlers.HTTPHandler POSTs via http.client; SMTPHandler opens SMTP;
+# Socket/Datagram/SysLogHandler open raw sockets). The receiver is not a bare
+# module Name, so the (module, attr) call table never sees them; flag the class
+# name on ANY receiver, like the asyncio openers. Over-declaration is the safe
+# direction for a screen (refute 2026-07-17).
+_NET_SINK_CLASSES = {
+    "HTTPHandler", "SMTPHandler", "SocketHandler",
+    "DatagramHandler", "SysLogHandler",
 }
 
 
@@ -142,12 +199,26 @@ class _DangerScanner(ast.NodeVisitor):
             self._mod_alias[local] = top           # remember the (aliased) name
             if top in _DANGER_IMPORTS:
                 self._need(_DANGER_IMPORTS[top], f"import {top}")
+            cap = _DANGER_IMPORT_PATHS.get(a.name)   # benign top, egress submodule
+            if cap is not None:
+                self._need(cap, f"import {a.name}")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
         top = (node.module or "").split(".")[0]
         if top in _DANGER_IMPORTS:
             self._need(_DANGER_IMPORTS[top], f"from {top} import …")
+        # full-path submodule egress: `from multiprocessing.connection import …`
+        # (module is the whole path) and `from multiprocessing import connection`
+        # (the path is module + the imported name).
+        cap = _DANGER_IMPORT_PATHS.get(node.module or "")
+        if cap is not None:
+            self._need(cap, f"from {node.module} import …")
+        for a in node.names:
+            capf = _DANGER_IMPORT_PATHS.get(f"{node.module}.{a.name}"
+                                            if node.module else a.name)
+            if capf is not None:
+                self._need(capf, f"from {node.module} import {a.name}")
         # `from os import system` / `from shutil import rmtree` / `from
         # subprocess import run` bind a dangerous callable under a bare name the
         # attribute scan (os.system(…)) would never see — screen the imported
@@ -197,10 +268,19 @@ class _DangerScanner(ast.NodeVisitor):
             elif f.id in self._call_alias:         # renamed `from … import x`
                 mod, attr = self._call_alias[f.id]
                 self._flag_modattr(mod, attr, f"{mod}.{attr}()")
-        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
-            # resolve the receiver through the alias map (o -> os)
-            mod = self._resolve_mod(f.value.id)
-            self._flag_modattr(mod, f.attr, f"{mod}.{f.attr}()")
+        elif isinstance(f, ast.Attribute):
+            if isinstance(f.value, ast.Name):
+                # resolve the receiver through the alias map (o -> os)
+                mod = self._resolve_mod(f.value.id)
+                self._flag_modattr(mod, f.attr, f"{mod}.{f.attr}()")
+            # An asyncio event-loop's raw-socket openers reach the network, but the
+            # loop is typically an unresolved call result (new_event_loop()...), so
+            # the module-qualified check above never sees it. Same for the
+            # logging.handlers.* network SINK classes, whose >=2-level receiver
+            # (logging.handlers) is not a bare module Name. Flag both distinctive
+            # name sets on ANY receiver (refute 2026-07-17).
+            if f.attr in _NET_METHOD_OPENERS or f.attr in _NET_SINK_CLASSES:
+                self._need("network", f".{f.attr}()")
         self.generic_visit(node)
 
     def _scan_getattr(self, node):

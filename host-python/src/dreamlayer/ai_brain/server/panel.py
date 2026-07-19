@@ -191,6 +191,7 @@ _PAGE = r"""<!doctype html><html lang="en"><head>
 
   /* connections + switches — the toggle is a Platinum slide switch */
   .conn{display:flex;gap:18px;align-items:center;justify-content:space-between;padding:16px 0;border-top:1px solid var(--line)}
+  .conn .cthumb{width:96px;height:51px;flex:none;object-fit:cover;border:1px solid var(--frame);border-radius:5px;background:#0B1012}
   .conn:first-of-type{border-top:0;padding-top:4px}
   .conn-t{font-size:1rem;font-weight:600} .conn-s{font-size:.85rem;color:var(--muted);margin-top:3px;max-width:46ch}
   .sw{position:relative;display:inline-block;width:46px;height:24px;flex:none;cursor:pointer}
@@ -512,6 +513,10 @@ _PAGE = r"""<!doctype html><html lang="en"><head>
       <div class="conn-s">One code wires the phone, this Brain, and your glasses together. In the app: Brain → Pair a device → scan or paste.</div></div>
       <button id="pairbtn" onclick="pair()">Pair a phone</button></div>
     <div id="pairout"></div>
+    <div class="conn"><div><div class="conn-t">Live Lens &middot; no app</div>
+      <div class="conn-s">Any phone's browser becomes the glasses: camera in, the real HUD out, answered by this Brain on your LAN. Nothing to install.</div></div>
+      <button id="livebtn" onclick="liveLink()">Get the link</button></div>
+    <div id="liveout"></div>
   </section>
 
   <section>
@@ -525,6 +530,9 @@ _PAGE = r"""<!doctype html><html lang="en"><head>
         <option value="anthropic">Anthropic</option>
         <option value="gemini">Google Gemini</option>
         <option value="openrouter">OpenRouter</option>
+        <option value="groq">Groq</option>
+        <option value="together">Together AI</option>
+        <option value="deepseek">DeepSeek</option>
         <option value="ollama">Ollama · local (free)</option>
         <option value="dreamlayer">DreamLayer Cloud</option>
         <option value="custom">Custom (OpenAI-compatible)</option>
@@ -627,6 +635,9 @@ _PAGE = r"""<!doctype html><html lang="en"><head>
           <option value="anthropic">Anthropic</option>
           <option value="gemini">Google Gemini</option>
           <option value="openrouter">OpenRouter</option>
+          <option value="groq">Groq</option>
+          <option value="together">Together AI</option>
+          <option value="deepseek">DeepSeek</option>
           <option value="ollama">Ollama · local</option>
         </select>
         <input type="text" id="abase" placeholder="http://localhost:1234/v1" oninput="renderApiWarn()" style="max-width:230px">
@@ -707,6 +718,22 @@ _PAGE = r"""<!doctype html><html lang="en"><head>
     <div class="conn-s" id="capsum" style="margin:0 0 10px">…</div>
     <div class="xgrid" id="packgrid" style="margin:0 0 8px"></div>
     <div id="caprows"></div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Proof</div><h2>Privacy receipt</h2>
+    <p class="lead">A signed, tamper-evident record of what the Brain did — each entry sealed to
+      the one before it and signed by this device's key. Verify it right here, offline; export a
+      copy anyone can check with just the public key.</p>
+    <div class="conn" id="recBanner" style="align-items:center;gap:12px">
+      <div style="flex:1;min-width:0">
+        <div class="conn-t" id="recHead">Loading the ledger…</div>
+        <div class="conn-s" id="recSub">&nbsp;</div>
+      </div>
+      <button class="sm" id="recVerify" onclick="verifyReceipt()">Verify receipt</button>
+      <button class="sm ghost" id="recExport" onclick="exportReceipt()">Export</button>
+    </div>
+    <ul id="receipts" class="feed"></ul>
   </section>
 
   <section>
@@ -794,6 +821,7 @@ const PAGES=[
   {id:"mind",label:"Intelligence",sub:"Choose your AI, point it at your files, and tune how it thinks.",match:["Wire the cloud","Folders it reads","Ask your stuff","Model"]},
   {id:"reach",label:"Connections",sub:"Pair your phone and glasses, and decide how far the Brain reaches.",match:["Reach","On your glasses"]},
   {id:"privacy",label:"Privacy",sub:"What's kept, what's shared, and the controls that keep it yours.",match:["Privacy controls"]},
+  {id:"receipts",label:"Receipts",sub:"A signed, tamper-evident record of what the Brain did — verify it yourself.",match:["Privacy receipt"]},
   {id:"plugins",label:"Plugins",sub:"Extend the Brain — browse, install, and manage plugins.",match:["Plugins"]},
   {id:"caps",label:"Capabilities",sub:"Every optional power of the Brain — what's on, what's off, and how to switch more on.",match:["Capabilities"]},
   {id:"learn",label:"Learn",sub:"How each feature works, with the card it draws on the glass.",match:["How it works"]},
@@ -812,6 +840,7 @@ const ICONS={
   mind:_sv+'<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>',
   reach:_sv+'<path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg>',
   privacy:_sv+'<path d="M12 3l7 3v5c0 4-3 7-7 9-4-2-7-5-7-9V6z"/></svg>',
+  receipts:_sv+'<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4"/><path d="M9.5 13l1.5 1.5L14.5 11"/></svg>',
   plugins:_sv+'<rect x="3" y="3" width="8" height="8" rx="1.4"/><rect x="13" y="3" width="8" height="8" rx="1.4"/><rect x="3" y="13" width="8" height="8" rx="1.4"/><rect x="13" y="13" width="8" height="8" rx="1.4"/></svg>',
   caps:_sv+'<circle cx="8" cy="12" r="5"/><path d="M8 7h8a5 5 0 0 1 0 10H8"/></svg>',
   learn:_sv+'<path d="M4 5a2 2 0 0 1 2-2h12v16H6a2 2 0 0 0-2 2z"/><path d="M18 3v18"/></svg>',
@@ -1032,7 +1061,7 @@ async function load(){
   if(c.config.email_enabled) loadMessages();
   renderPlan(c.plan);
   refreshStatus(); loadHistory(); loadHealth(); loadAgenda(); loadPeople(); loadCalendars();
-  loadContactsSync(); loadReminders(); loadCaps();
+  loadContactsSync(); loadReminders(); loadCaps(); loadReceipt();
 }
 
 function fmtWhen(ts){if(!ts)return "";const d=new Date(ts*1000);
@@ -1234,19 +1263,70 @@ function pickModel(m,silent){modelSel=m;
 // a public host), or anything unparseable — is a REMOTE endpoint your queries
 // leave the device to reach.
 function isLocalUrl(u){
-  let host;try{host=new URL(u).hostname.toLowerCase();}catch(e){return null;}   // null = can't tell yet
-  if(!host)return null;
-  if(host[0]==="["&&host[host.length-1]==="]")host=host.slice(1,-1);            // strip IPv6 brackets
-  if(host==="localhost"||host.endsWith(".local")||host==="::1")return true;
-  const m=host.match(/^(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)$/);
-  if(m){const a=+m[1],b=+m[2];
+  // Locality MUST match backends.is_local_endpoint exactly: this banner tells the
+  // wearer whether a query leaves the device, and the server's egress accounting
+  // is the source of truth. Python classifies with urllib.urlsplit, so we mirror
+  // urlsplit's host extraction with string ops rather than reading
+  // new URL().hostname — which diverged on 7 adversarial inputs by showing "on
+  // your device" for a host the server counts as REMOTE egress (audit 2026-07-17):
+  //   * new URL IDNA-folds a fullwidth homoglyph host ("http://ｌｏｃ
+  //     ａｌｈｏｓｔ") to ASCII "localhost"; urlsplit keeps
+  //     the raw host -> remote.
+  //   * new URL tolerates a missing/single/back slash ("http:localhost",
+  //     "http:/x", "http:\\x") and still yields host "localhost"; urlsplit needs a
+  //     real "//" authority or there is no host -> remote.
+  // So: strip the chars urlsplit strips, require a "//" authority, take the host
+  // WITHOUT any Unicode mapping, and never claim local for anything else.
+  u=(u||"").replace(/[\t\r\n]/g,"");                    // urlsplit strips these too
+  if(!u)return null;                                    // empty (still typing) — unknown
+  let rest=null;
+  const sm=u.match(/^[a-zA-Z][a-zA-Z0-9+.\-]*:\/\//);
+  if(sm)rest=u.slice(sm[0].length);                     // scheme://authority
+  else if(u.slice(0,2)==="//")rest=u.slice(2);          // //authority (scheme-relative)
+  if(rest===null)return null;                           // no "//" authority — can't claim local
+  let auth=rest.split("/")[0].split("?")[0].split("#")[0];
+  const at=auth.lastIndexOf("@");
+  if(at>=0){
+    // urllib.urlsplit rejects a bracket in the USERINFO (raises ValueError, which
+    // is_local_endpoint catches -> REMOTE): "http://[::1]@127.0.0.1" is remote,
+    // NOT the loopback the naive after-the-@ strip would green. Mirror that or the
+    // banner shows "on your device" for a host the server silences in incognito
+    // and counts as cloud egress (refute 2026-07-17).
+    const ui=auth.slice(0,at);
+    if(ui.indexOf("[")>=0||ui.indexOf("]")>=0)return false;
+    auth=auth.slice(at+1);                              // drop userinfo (host is after the last @)
+  }
+  if(auth[0]==="["){
+    // A bracket holds an IPv6 literal ONLY. Python's urlsplit rejects (ValueError
+    // -> remote) a bracketed name/IPv4 ("[localhost]", "[127.0.0.1]") and any junk
+    // after "]" ("[::1]extra", "[::1].local"); is_local_endpoint counts an IPv6
+    // local only in ::1/128. Mirror all of that or the naive "extract the brackets"
+    // reads local for a host the server treats as remote (refute 2026-07-17).
+    const e=auth.indexOf("]");
+    if(e<0)return false;                                 // unterminated bracket -> remote
+    const after=auth.slice(e+1);
+    if(after!==""&&after[0]!==":")return false;          // junk after "]" -> Python ValueError -> remote
+    return auth.slice(1,e).toLowerCase()==="::1";        // loopback IPv6 only; any other -> remote
+  }
+  let host=auth.split(":")[0].toLowerCase();             // non-bracketed: drop :port
+  if(!host)return false;
+  if(host==="localhost"||host.endsWith(".local"))return true;
+  const m=host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);   // ASCII \d only — a fullwidth digit never matches
+  if(m){const o=[m[1],m[2],m[3],m[4]];
+    // Python's ipaddress rejects leading-zero and >255 octets (both -> remote);
+    // mirror both so "010.0.0.1"/"10.999.0.0" can't read local here yet remote there.
+    for(let i=0;i<4;i++){if(o[i].length>1&&o[i][0]==="0")return false;if(+o[i]>255)return false;}
+    const a=+o[0],b=+o[1];
     return a===127||a===10||(a===192&&b===168)||(a===172&&b>=16&&b<=31)||(a===169&&b===254);}
-  return false;                                                                 // public / bare host → remote
+  return false;                                         // public / bare host → remote
 }
 const APROV={custom:{base:"",model:"",key:true},openai:{base:"https://api.openai.com",model:"gpt-4o-mini",key:true},
   anthropic:{base:"https://api.anthropic.com",model:"claude-3-5-haiku-latest",key:true},
   gemini:{base:"https://generativelanguage.googleapis.com",model:"gemini-1.5-flash",key:true},
   openrouter:{base:"https://openrouter.ai/api",model:"openai/gpt-4o-mini",key:true},
+  groq:{base:"https://api.groq.com/openai/v1",model:"llama-3.3-70b-versatile",key:true},
+  together:{base:"https://api.together.xyz/v1",model:"meta-llama/Llama-3.3-70B-Instruct-Turbo",key:true},
+  deepseek:{base:"https://api.deepseek.com",model:"deepseek-chat",key:true},
   ollama:{base:"http://localhost:11434",model:"llama3.2",key:false}};
 function apiPreset(apply){const p=APROV[$("aprov").value]||APROV.custom;
   if(apply){$("abase").value=p.base;$("amodel").value=p.model;}
@@ -1402,6 +1482,16 @@ async function pair(){const out=$("pairout");out.innerHTML='<div class="paircode
 }
 function copyPair(){const c=window._pc||"";if(navigator.clipboard){navigator.clipboard.writeText(c).then(()=>toast("Copied"));}
   else{const r=document.createRange();r.selectNode($("thecode"));getSelection().removeAllRanges();getSelection().addRange(r);toast("Selected — ⌘C");}}
+async function liveLink(){const out=$("liveout");out.innerHTML='<div class="paircode"><div class="shimmer"></div></div>';
+  let r;try{r=await api("/dreamlayer/live/link");}catch(e){r=null;}
+  if(!r||!r.url){out.innerHTML='<div class="paircode" style="border-color:var(--line)"><div class="conn-s">'+
+    'The Live Lens link is offered only from the Brain itself. Open <b>http://localhost:7777/</b> on this machine '+
+    'and try again — the link still points the phone at this Brain\'s LAN address.</div></div>';return;}
+  const qr=r.qr?`<div class="qrbox">${r.qr}</div><div class="conn-s" style="margin:6px 0 10px">Scan with the phone's camera — the link carries the pairing token, so treat it like the pairing code.</div>`:"";
+  out.innerHTML=`<div class="paircode">${qr}<div class="foot"><span class="url">${esc(r.url)}</span></div>`+
+    `<div class="conn-s" style="margin-top:8px">${esc(r.note||"")}</div></div>`;
+  toast("Live Lens link ready");
+}
 async function loadHistory(){const h=await api("/dreamlayer/history");
   $("history").innerHTML=(h.items||[]).map(x=>{
     const tag=x.kind==="ask"?(x.tier||"ask"):x.kind;
@@ -1412,12 +1502,154 @@ async function loadHistory(){const h=await api("/dreamlayer/history");
     ||'<li class="empty">Nothing yet — add a folder, ask a question, pair your phone.</li>';
 }
 
+/* ---- Privacy receipt: fetch, render, and VERIFY the signed ledger --------
+   GET /dreamlayer/receipt returns the hash-chained, Ed25519-signed activity
+   ledger + the public key. We verify it HERE, offline: the SHA-256 chain (each
+   entry seals the one before it) always, and the signature when this browser's
+   WebCrypto exposes Ed25519 (WKWebView 17+/WebView2/Chromium 137+). The canonical
+   bytes must reproduce Python's json.dumps(sort_keys=True, separators=(',',':'),
+   ensure_ascii=True) EXACTLY — canonCore() below does, and a known-answer self
+   test guards it: if it ever drifts we degrade to chain-only rather than raise a
+   false tamper alarm. Signature is over the 5-field core {seq,ts,kind,text,prev}. */
+let RECEIPT=null, ED25519=null;
+
+function _pyStr(s){s=(s==null)?"":String(s);let o='"';
+  for(const ch of s){const cp=ch.codePointAt(0);
+    if(ch==='"')o+='\\"';else if(ch==='\\')o+='\\\\';
+    else if(cp===8)o+='\\b';else if(cp===9)o+='\\t';else if(cp===10)o+='\\n';
+    else if(cp===12)o+='\\f';else if(cp===13)o+='\\r';
+    else if(cp<0x20)o+='\\u'+cp.toString(16).padStart(4,'0');
+    else if(cp<0x80)o+=ch;
+    else if(cp>0xFFFF){const c=cp-0x10000;
+      o+='\\u'+(0xD800+(c>>10)).toString(16).padStart(4,'0')
+        +'\\u'+(0xDC00+(c&0x3FF)).toString(16).padStart(4,'0');}
+    else o+='\\u'+cp.toString(16).padStart(4,'0');}
+  return o+'"';}
+// ts is a float from time.time(); Python renders an integer-valued float as "N.0"
+function _pyFloat(v){v=Number(v);return Number.isInteger(v)?v.toFixed(1):String(v);}
+function canonCore(r){return '{"kind":'+_pyStr(r.kind)+',"prev":'+_pyStr(r.prev||"")
+  +',"seq":'+String(r.seq)+',"text":'+_pyStr(r.text)+',"ts":'+_pyFloat(r.ts)+'}';}
+// canonical form of the head-anchor core {last_seq,head,count} (sorted keys)
+function _canonHead(h){return '{"count":'+String(h.count)+',"head":'+_pyStr(h.head)+',"last_seq":'+String(h.last_seq)+'}';}
+
+const _enc=new TextEncoder();
+async function _sha256hex(bytes){const h=await crypto.subtle.digest("SHA-256",bytes);
+  return Array.prototype.map.call(new Uint8Array(h),b=>b.toString(16).padStart(2,'0')).join('');}
+function _hexToBytes(h){h=h||"";const a=new Uint8Array(Math.floor(h.length/2));
+  for(let i=0;i<a.length;i++)a[i]=parseInt(h.substr(i*2,2),16);return a;}
+async function _probeEd25519(){if(ED25519!==null)return ED25519;
+  try{await crypto.subtle.importKey("raw",new Uint8Array(32),{name:"Ed25519"},false,["verify"]);
+    ED25519=true;}catch(e){ED25519=false;}return ED25519;}
+async function _edVerify(pubHex,sigHex,bytes){
+  try{const k=await crypto.subtle.importKey("raw",_hexToBytes(pubHex),{name:"Ed25519"},false,["verify"]);
+    return await crypto.subtle.verify({name:"Ed25519"},k,_hexToBytes(sigHex),bytes);}
+  catch(e){return false;}}
+// known-answer: matches the Python vector in test_receipt_verify_vectors.py
+function _canonSelfTest(){
+  const r={seq:2,ts:1700000000.0,kind:"plugin",text:"emoji 🎉 and quote \" and backslash \\",prev:"deadbeef"};
+  return canonCore(r)==='{"kind":"plugin","prev":"deadbeef","seq":2,"text":"emoji \\ud83c\\udf89 and quote \\" and backslash \\\\","ts":1700000000.0}';}
+
+function _recRow(rec,broken){
+  const t=new Date((Number(rec.ts)||0)*1000).toLocaleTimeString();
+  const bs=broken?'border-left:3px solid var(--attention);padding-left:8px':'';
+  return `<li style="${bs}"><div style="flex:1;min-width:0">
+    <div class="q">${esc(rec.text||rec.kind)}</div>
+    <div class="a" style="font-family:monospace;font-size:11px">seq ${esc(String(rec.seq))} · #${esc((rec.prev||'genesis').slice(0,10))}</div></div>
+    <span class="tag ${esc(rec.kind)}">${esc(rec.kind)}</span>
+    <span class="conn-s" style="margin:0 0 0 8px">${esc(t)}</span></li>`;}
+function _renderRecs(badSet){const recs=(RECEIPT&&RECEIPT.records)||[];
+  $("receipts").innerHTML = recs.length
+    ? recs.map((x,i)=>[x,i]).reverse().map(([x,i])=>_recRow(x,badSet&&badSet.has(i))).join("")
+    : '<li class="empty">Nothing recorded yet.</li>';}
+
+async function loadReceipt(){let r;try{r=await api("/dreamlayer/receipt");}catch(e){return;}
+  RECEIPT=r; _renderRecs(null);
+  const n=(r.records||[]).length;
+  $("recHead").textContent = n?`${n} sealed ${n===1?'entry':'entries'} · not verified yet`:"No activity recorded yet";
+  $("recSub").innerHTML = r.pubkey
+    ? `Signed by this device · <span style="font-family:monospace">key ${esc(r.pubkey.slice(0,8))}…${esc(r.pubkey.slice(-4))}</span>`
+    : "Unsigned — install the privacy extra so the Brain signs the ledger.";
+  $("recVerify").disabled = !n;}
+
+async function verifyReceipt(){
+  let r=RECEIPT; if(!r){await loadReceipt(); r=RECEIPT;} if(!r)return;
+  const recs=r.records||[]; if(!recs.length)return;
+  const canonOK=_canonSelfTest();
+  const sigSupported=(await _probeEd25519()) && !!r.pubkey && canonOK;
+  let chainOK=true, seqOK=true, sigOK=true, firstBroken=-1;
+  // anchor at recs[0].prev, not "" — the endpoint returns only the last N, so
+  // the window may legitimately start mid-chain; verify links within it.
+  let prev=recs[0].prev||"";
+  const base=recs[0].seq;
+  for(let i=0;i<recs.length;i++){const rec=recs[i]; const bytes=_enc.encode(canonCore(rec));
+    if(i>0 && (rec.prev||"")!==prev){chainOK=false; if(firstBroken<0)firstBroken=i;}
+    if(rec.seq!==base+i)seqOK=false;
+    if(sigSupported && !(await _edVerify(r.pubkey,rec.sig||"",bytes))){sigOK=false; if(firstBroken<0)firstBroken=i;}
+    prev=await _sha256hex(bytes);}
+  // signed head anchor — independent tail-length attestation (defeats truncation)
+  let attested=null, tailShort=false, unattested=false, headVerified=false;
+  const h=r.head;
+  if(sigSupported && h && h.sig){
+    const hOK=await _edVerify(r.pubkey, h.sig, _enc.encode(_canonHead(h)));
+    if(!hOK){chainOK=false; if(firstBroken<0)firstBroken=recs.length-1;}
+    else{headVerified=true; attested=h.count; const lastSeq=recs[recs.length-1].seq;
+      if(h.last_seq===lastSeq){ if(h.head!==prev){chainOK=false; if(firstBroken<0)firstBroken=recs.length-1;} }
+      else if(h.last_seq<lastSeq){unattested=true;}
+      else{tailShort=true;}}}
+  const banner=$("recBanner"), hEl=$("recHead"), sub=$("recSub");
+  const signedLedger=!!r.pubkey;
+  const hardTamper = !chainOK || !seqOK || (sigSupported && !sigOK) || unattested;
+  // a signed ledger is complete only when a valid head anchor ties the shown
+  // tail to the signed length; an unsigned ledger has nothing to attest
+  const tailComplete = !signedLedger || (sigSupported && headVerified && !tailShort);
+  const fullyVerified = signedLedger && sigSupported && !hardTamper && tailComplete;
+  banner.style.borderLeft = fullyVerified?"3px solid var(--success)":(hardTamper?"3px solid var(--attention)":"3px solid var(--amber)");
+  if(fullyVerified){
+    hEl.textContent="Verified · signed by this device, unaltered";
+    sub.textContent=`${recs.length}${attested&&attested>recs.length?` of ${attested}`:''} entries · chain intact · signature valid`;
+    _renderRecs(null);
+  }else if(hardTamper){
+    hEl.textContent = unattested ? "Tampering detected · unattested entries" : `Tampering detected · entry ${firstBroken+1}`;
+    sub.textContent = unattested
+      ? "The ledger carries entries beyond its signed length — records were appended without the Brain's key."
+      : !chainOK
+        ? "A hash-chain link (or the signed length anchor) is broken — an entry was altered or removed after signing."
+        : (!seqOK ? "A sequence number is missing — an entry was deleted."
+                  : "A signature failed — a record was changed after it was signed.");
+    const bad=new Set(); for(let i=Math.max(firstBroken,0);i<recs.length;i++)bad.add(i);
+    _renderRecs(bad);
+  }else if(!signedLedger){
+    hEl.textContent="Unsigned ledger";
+    sub.textContent="The chain is internally consistent, but this Brain isn't signing receipts (no privacy extra).";
+    _renderRecs(null);
+  }else if(!sigSupported){
+    hEl.textContent="Chain intact · signature not checked here";
+    sub.textContent="Every entry seals the one before it, but this browser can't run Ed25519 — export and verify the signature (and completeness) elsewhere.";
+    _renderRecs(null);
+  }else if(tailShort){
+    hEl.textContent="Recent entries may be missing";
+    sub.textContent=`The signed length is ${attested}, but only ${recs.length} were returned. The shown entries are authentic — re-verify; if it persists, the tail was truncated.`;
+    _renderRecs(null);
+  }else{
+    hEl.textContent="Can't confirm completeness";
+    sub.textContent="The shown entries are authentic, but the signed length anchor is missing — re-verify; if it persists, treat with suspicion.";
+    _renderRecs(null);}}
+
+async function exportReceipt(){let r=RECEIPT; if(!r){try{r=await api("/dreamlayer/receipt");}catch(e){return;}}
+  const blob=new Blob([JSON.stringify(r,null,2)],{type:"application/json"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+  a.download="dreamlayer-receipt.json"; document.body.appendChild(a); a.click();
+  a.remove(); URL.revokeObjectURL(a.href); toast("Exported receipt.json");}
+
 /* cloud provider — presets mirror backends.PROVIDER_PRESETS */
 const CPROV={
   openai:{base:"https://api.openai.com",model:"gpt-4o-mini",key:true},
   anthropic:{base:"https://api.anthropic.com",model:"claude-3-5-haiku-latest",key:true},
   gemini:{base:"https://generativelanguage.googleapis.com",model:"gemini-1.5-flash",key:true},
   openrouter:{base:"https://openrouter.ai/api",model:"openai/gpt-4o-mini",key:true},
+  groq:{base:"https://api.groq.com/openai/v1",model:"llama-3.3-70b-versatile",key:true},
+  together:{base:"https://api.together.xyz/v1",model:"meta-llama/Llama-3.3-70B-Instruct-Turbo",key:true},
+  deepseek:{base:"https://api.deepseek.com",model:"deepseek-chat",key:true},
   ollama:{base:"http://localhost:11434",model:"llama3.2",key:false},
   dreamlayer:{base:"https://api.dreamlayer.app",model:"dreamlayer-standard",key:true},
   custom:{base:"",model:"",key:true},
@@ -1559,7 +1791,7 @@ async function loadPlugins(){let r;try{r=await api("/dreamlayer/plugins");}catch
   if(!(r.installed||[]).length){ul.innerHTML='<li class="conn-s" style="margin:0">No plugins installed yet — browse the store.</li>';return;}
   ul.innerHTML=(r.installed||[]).map(p=>{
     const perms=(p.requires||[]).length?(p.requires||[]).map(x=>"needs "+esc(x)).join(" · "):"no special access";
-    return '<li class="conn"><div style="flex:1;cursor:pointer" onclick="openPluginDetail(\''+esc(p.name)+'\')"><div class="conn-t">'+esc(p.name)+' <span class="conn-s">v'+esc(p.version||"")+'</span>'+(p.official?' <span style="color:var(--memory)">✓ Official</span>':'')+'</div>'+
+    return '<li class="conn">'+(p.screenshot?'<img class="cthumb" src="'+esc(p.screenshot)+'" alt="'+esc(p.name)+' on the glass" onclick="openPluginDetail(\''+esc(p.name)+'\')" style="cursor:pointer">':'')+'<div style="flex:1;cursor:pointer" onclick="openPluginDetail(\''+esc(p.name)+'\')"><div class="conn-t">'+esc(p.name)+' <span class="conn-s">v'+esc(p.version||"")+'</span>'+(p.official?' <span style="color:var(--memory)">✓ Official</span>':'')+'</div>'+
       '<div class="conn-s">'+perms+' · <span style="color:var(--memory)">See what it does →</span></div></div>'+
       '<button class="sm ghost" onclick="removePlugin(\''+esc(p.name)+'\')">Remove</button></li>';
   }).join("");}

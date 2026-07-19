@@ -26,7 +26,82 @@
     amber: "#FF6600",      // WARNING_AMBER (fact-check "check this")
     recall: "#5B7CFF",     // face-recall eyebrow
     border: "#2A3C44",
+    trace: "#00FFAA",      // MEMORY_TRACE
+    coralDim: "#7A3A2C",   // ACCENT_ATTENTION_DIM
   };
+
+  /* ---- Juno, as pixels — the desk accessory earns her seat on the glass.
+     32x32, quantized from landing/assets/juno/juno_icon32.png into three
+     palette levels: 1 outline, 2 body, 3 wings and highlights. Keep the
+     three copies in lockstep: here, halo-lua/display/renderer.lua and
+     hud/renderer.py (JUNO_ROWS). ------------------------------------- */
+  var JUNO_ROWS = [
+    ".......................1........",
+    "......................121.......",
+    ".................1221122........",
+    ".................1222322........",
+    "...............1.1232121........",
+    "..1221.......1222222212...1221..",
+    "..23332.....122233232....23332..",
+    "..1333331...122332212..2333331..",
+    "...2333332..12232211113333332...",
+    "...133333331.1232...233333331...",
+    "....133333332.22..1233333331....",
+    ".....1233333323322233333321.....",
+    ".......223332333322333322.......",
+    "..........222333232221..........",
+    ".......12232233323233221........",
+    ".....133333223331233333331......",
+    "....23333321233321333333332.....",
+    "....3333322.233331.23333333.....",
+    ".....22221.1333332...12222......",
+    "...........13333331.............",
+    "...........23233332.............",
+    "...........2223333321...........",
+    "...........222233333322.........",
+    "...........1222223333331........",
+    "............223222333333........",
+    "............122222133232........",
+    ".............222.2111.1.........",
+    "..............12222.............",
+    "...............2222.............",
+    "...............2211.............",
+    "...............11...............",
+    "................................"
+  ];
+  // horizontal runs [y, x, w, level], built once
+  var JUNO_SPANS = (function () {
+    var out = [], y, x, x2, row, ch;
+    for (y = 0; y < JUNO_ROWS.length; y++) {
+      row = JUNO_ROWS[y];
+      for (x = 0; x < row.length;) {
+        ch = row[x];
+        if (ch === ".") { x++; continue; }
+        x2 = x;
+        while (x2 + 1 < row.length && row[x2 + 1] === ch) x2++;
+        out.push([y, x, x2 - x + 1, +ch]);
+        x = x2 + 1;
+      }
+    }
+    return out;
+  })();
+  // her liveries (level -> palette). Veil drops the outline: gone dark.
+  var JUNO_TEAL = { 1: C.tealDim, 2: C.teal, 3: C.trace };
+  var JUNO_VEIL = { 2: C.coralDim, 3: C.coral };
+
+  // Draw Juno centred on (cx, cy) at integer pixel scale px (pixel art
+  // never tweens — scale in whole steps).
+  function drawJuno(c, cx, cy, px, colors, alpha) {
+    var ox = cx - 16 * px, oy = cy - 16 * px, i, s, col;
+    if (alpha != null) { c.save(); c.globalAlpha = alpha; }
+    for (i = 0; i < JUNO_SPANS.length; i++) {
+      s = JUNO_SPANS[i]; col = colors[s[3]];
+      if (!col) continue;
+      c.fillStyle = col;
+      c.fillRect(ox + s[1] * px, oy + s[0] * px, s[2] * px, px);
+    }
+    if (alpha != null) c.restore();
+  }
 
   /* ======================================================================
      1. VOICE GRAMMAR — port of orchestrator/voice.py parse_intent
@@ -520,7 +595,7 @@
     this.figment = null;
     this.card = { type: "brief", eyebrow: "YOUR DAY",
       primary: "Three meetings, one deadline.",
-      detail: "Clear after 3pm.", footer: "next — 10:00 standup", shownAt: now() };
+      detail: "Clear after 3pm.", footer: "next · 10:00 standup", shownAt: now() };
     return "Your day: three meetings, one deadline, clear after three.";
   };
   // Truth Lens / Veritas (cards.fact_check) — a quiet verdict on a claim.
@@ -612,8 +687,30 @@
   function Glass(canvas, sim) {
     this.cv = canvas; this.ctx = canvas.getContext("2d"); this.sim = sim;
     this._t0 = now(); this._last = now(); this._raf = 0; this._on = true;
+    this._sparks = []; this._junoIn = null; this._wasReady = false;  // fly-in state
     this.resize();
   }
+  // Juno's arrival sparkles: spawned along her flight, aged + drawn each frame.
+  Glass.prototype._spawnSparks = function (x, y, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, s = 0.5 + Math.random() * 1.6;
+      this._sparks.push({ x: x + (Math.random() - 0.5) * 22, y: y + (Math.random() - 0.5) * 22,
+        vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0, max: 12 + Math.random() * 16, r: 2 + Math.random() * 2.5 });
+    }
+  };
+  Glass.prototype._drawSparks = function () {
+    var c = this.ctx, keep = [];
+    for (var i = 0; i < this._sparks.length; i++) {
+      var s = this._sparks[i]; s.x += s.vx; s.y += s.vy; s.vy += 0.02; s.life++;
+      var lf = 1 - s.life / s.max; if (lf <= 0) continue;
+      var col = Math.random() < 0.55 ? C.trace : C.text, r = s.r * lf;
+      c.strokeStyle = rgba(col, lf * 0.9); c.lineWidth = 1;
+      c.beginPath(); c.moveTo(s.x - r, s.y); c.lineTo(s.x + r, s.y);
+      c.moveTo(s.x, s.y - r); c.lineTo(s.x, s.y + r); c.stroke();
+      keep.push(s);
+    }
+    this._sparks = keep;
+  };
   Glass.prototype.resize = function () {
     var dpr = Math.min(root.devicePixelRatio || 1, 2);
     var css = this.cv.clientWidth || 320;
@@ -641,6 +738,12 @@
     // interrupts a running figment, then the glass returns to the countdown —
     // the way an active request takes the stage on the device.
     var fresh = sim.card && sim.card.shownAt != null && (now() - sim.card.shownAt) < 5;
+    // Juno flies in whenever the glass returns to the ready state (a card or
+    // figment clearing, or the veil lifting). The veil itself stays a hard
+    // cut — nothing about it may feel ambient — so there is no fly-out.
+    var isReady = !sim.incognito && !(sim.figment && !sim.figment.ended) && !sim.card;
+    if (isReady && !this._wasReady) this._junoIn = t;
+    this._wasReady = isReady;
     if (sim.incognito) this._veil(t);
     else if (fresh && sim.card.type === "recall") this._recall(sim.card);
     else if (fresh && sim.card.type === "answer") this._answer(sim.card, t);
@@ -653,15 +756,32 @@
     else if (sim.card && sim.card.type === "fact") this._fact(sim.card, t);
     else if (sim.card && sim.card.type === "brief") this._brief(sim.card);
     else if (sim.card && sim.card.type === "toast") this._toast(sim.card);
+    else if (sim.card && sim.card.type === "object") this._object(sim.card, t);
+    else if (sim.card && sim.card.type === "intro") this._intro(sim.card, t);
+    else if (sim.card && sim.card.type === "waypath") this._waypath(sim.card, t);
+    else if (sim.card && sim.card.type === "keep") this._keep(sim.card, t);
+    else if (sim.card && sim.card.type === "rosetta") this._rosetta(sim.card, t);
     else this._ready(t);
+    this._drawSparks();          // arrival sparkles overlay the glass, then fade
     c.restore();
   };
 
   Glass.prototype._ready = function (t) {
-    var c = this.ctx, br = 0.45 + 0.3 * (0.5 + 0.5 * Math.sin(t * 1.6));
-    c.strokeStyle = rgba(C.teal, 0.6 * br); c.lineWidth = 2;
-    c.beginPath(); c.arc(CX, CX, 26, 0, Math.PI * 2); c.stroke();
-    c.fillStyle = rgba(C.teal, br); c.beginPath(); c.arc(CX, CX, 5, 0, Math.PI * 2); c.fill();
+    // Juno at the core — the brain is listening, in person. On arrival she
+    // flies up from below on a sparkle trail and settles; then she bobs and
+    // breathes. The panel's desk accessory and the device ReadyCard wear the
+    // same sprite (the fly-in is this surface's flourish).
+    var inT = this._junoIn != null ? (t - this._junoIn) : 999, DUR = 0.85;
+    var cx = CX, cy, al;
+    if (inT < DUR) {
+      var e = inT / DUR; e = e * e * (3 - 2 * e);          // smoothstep
+      cx = CX + (1 - e) * 64; cy = 112 + (1 - e) * 150; al = Math.min(1, e * 1.6);
+      this._spawnSparks(cx, cy, inT < DUR * 0.9 ? 2 : 6);  // trail, then a settle shimmer
+    } else {
+      var bob = Math.round(2 * Math.sin(t * 1.6));
+      cy = 112 + bob; al = 0.75 + 0.25 * Math.sin(t * 3.2);
+    }
+    drawJuno(this.ctx, cx, cy, 3, JUNO_TEAL, al);
     this.text("listening for what matters", CX, 192, "xs", C.ghost);
   };
   Glass.prototype._figment = function (f, t) {
@@ -686,11 +806,11 @@
   };
   Glass.prototype._answer = function (card, t) {
     var c = this.ctx;
-    // a soft bloomed cue ring — the "answer on the glass" arriving
+    // mini Juno delivers the answer — the cue dot grew wings; she
+    // breathes softly as the answer arrives
     var br = 0.5 + 0.5 * Math.sin((t || 0) * 2.2);
-    c.strokeStyle = rgba(C.teal, 0.14 + 0.12 * br); c.lineWidth = 1.5;
-    c.beginPath(); c.arc(CX, 66, 4, 0, Math.PI * 2); c.stroke();
-    this.text("ANSWER", CX, 66, "sm", C.teal);
+    drawJuno(c, CX, 46, 1, JUNO_TEAL, 0.8 + 0.2 * br);
+    this.text("ANSWER", CX, 70, "sm", C.teal);
     // hero answer — wrap to at most two lines, drop a size if long
     var p = String(card.primary), lines = this._wrap(p, p.length > 14 ? 16 : 12).slice(0, 2);
     var tok = (p.length > 22 || lines.length > 1) ? "lg" : "xl";
@@ -746,13 +866,136 @@
     for (var j = 0; j < lines.length; j++) this.text(lines[j], CX, 130 + j * 26, "md", C.text);
   };
   Glass.prototype._veil = function (t) {
-    var c = this.ctx, x = CX, y = CX - 6, r = 26;
-    c.strokeStyle = rgba(C.coral, 0.9); c.lineWidth = 2; c.beginPath();
-    for (var i = 0; i < 6; i++) { var a = Math.PI / 180 * (60 * i - 30), px = x + r * Math.cos(a), py = y + r * Math.sin(a); i ? c.lineTo(px, py) : c.moveTo(px, py); }
-    c.closePath(); c.stroke();
-    c.fillStyle = rgba(C.coral, 0.9); c.fillRect(x - 8, y - 8, 5, 16); c.fillRect(x + 3, y - 8, 5, 16);
+    // Juno goes dark: still on the glass, wings down, seeing nothing.
+    // She holds perfectly still — nothing about the veil may feel ambient.
+    drawJuno(this.ctx, CX, 106, 3, JUNO_VEIL, 0.6);
     this.text("PRIVACY VEIL", CX, 176, "sm", C.coral);
     this.text("Nothing is captured", CX, 198, "xs", C.ghost);
+  };
+
+  /* ---- the World lenses, drawn live (the homepage scroll + gallery run
+     these through .show(type,data); each plays a real intro off its own
+     clock, so a look reveals rather than cross-fades). Content mirrors the
+     product cards (cards.py); the reveal is this surface's flourish. ---- */
+  // intro progress for a shown card: 0→1 smoothstepped over `dur`. A card with
+  // no _in (or shown instant) reads as fully arrived, so a persistent/reduced
+  // frame is complete, not mid-animation.
+  Glass.prototype._u = function (card, t, dur) {
+    var base = (card && card._in != null) ? card._in : -999;
+    var s = (t - base) / (dur || 0.7); s = s < 0 ? 0 : s > 1 ? 1 : s;
+    return s * s * (3 - 2 * s);
+  };
+  // the circle's inner width at height y — text must fit inside this chord or the
+  // round clip shaves its ends (iOS monospace runs wider than desktop, so a line
+  // that fit in QA can overflow on a phone; measure + shrink defends every font).
+  Glass.prototype._chord = function (y) {
+    var d = Math.abs(y - CX); return d >= CX ? 0 : 2 * Math.sqrt(CX * CX - d * d);
+  };
+  Glass.prototype._ta = function (s, x, y, tok, hex, a, pad) {   // alpha + shrink-to-fit
+    var c = this.ctx, px = FONTPX[tok] || 20; s = String(s);
+    c.textAlign = "center"; c.textBaseline = "middle"; c.font = this.font(tok);
+    var maxW = this._chord(y) - (pad == null ? 26 : pad), w = c.measureText(s).width;
+    if (w > maxW && maxW > 0) { px = Math.max(8, Math.floor(px * maxW / w));
+      c.font = "600 " + px + "px ui-monospace, 'SF Mono', Menlo, monospace"; }
+    c.fillStyle = rgba(hex, a < 0 ? 0 : a > 1 ? 1 : a); c.fillText(s, x, y);
+  };
+  Glass.prototype._eyebrow = function (label, hex, u) {     // eyebrow + hairline rule
+    var c = this.ctx; this._ta(label, CX, 66, "sm", hex, u);
+    c.strokeStyle = rgba(hex, 0.5 * u); c.lineWidth = 1;
+    c.beginPath(); c.moveTo(CX - 46, 80); c.lineTo(CX + 46, 80); c.stroke();
+  };
+
+  // Juno / Object — glance at a thing, know it. Juno flies up on a sparkle
+  // trail; the object's name + your own facts resolve beneath her.
+  Glass.prototype._object = function (card, t) {
+    var u = this._u(card, t, 0.9), dy = (1 - u) * 10;
+    var ji = this._u(card, t, 0.6);                        // Juno arrival, quicker
+    var jy = 96 - (1 - ji) * 120, jal = Math.min(1, ji * 1.6);
+    if (ji < 1) this._spawnSparks(CX, jy, ji < 0.85 ? 2 : 6);
+    drawJuno(this.ctx, CX, jy, 2, JUNO_TEAL, jal);
+    this._ta(card.eyebrow || "JUNO", CX, 128, "sm", C.teal, u);
+    var title = String(card.title || ""), tok = title.length > 12 ? "lg" : "xl";
+    this._ta(title, CX, 158 + dy, tok, C.text, u);
+    if (card.cap) this._ta(card.cap, CX, 186 + dy, "md", C.text2, u);
+    if (card.ghost) this._ta(this._clip(card.ghost, 26), CX, 202 + dy, "xs", C.ghost, u * 0.9);
+  };
+
+  // Social — an introduction kept. An avatar ring blooms open; only people
+  // who introduce themselves are ever kept (never a stranger lookup).
+  Glass.prototype._intro = function (card, t) {
+    var c = this.ctx, u = this._u(card, t, 0.85), dy = (1 - u) * 10;
+    var rr = 26, letter = String(card.initial || (card.name || "?").charAt(0)).toUpperCase();
+    for (var k = 2; k >= 0; k--) {                          // concentric rings blooming out
+      var ru = this._u(card, t, 0.5 + k * 0.12);
+      c.strokeStyle = rgba(C.teal, (0.5 - k * 0.16) * ru); c.lineWidth = k === 0 ? 2 : 1;
+      c.beginPath(); c.arc(CX, 84, rr + k * 9 * ru, 0, Math.PI * 2); c.stroke();
+    }
+    this._ta(letter, CX, 84, "lg", C.text, u);
+    this._ta(card.eyebrow || "INTRODUCTION", CX, 132, "sm", C.teal, u);  // under the ring, no rule
+    this._ta(String(card.title || ""), CX, 160 + dy, "lg", C.text, u);
+    if (card.cap) this._ta(card.cap, CX, 188 + dy, "md", C.text2, u);
+    if (card.ghost) this._ta(this._clip(card.ghost, 26), CX, 202 + dy, "xs", C.ghost, u * 0.9);
+  };
+
+  // Waypath / Recall — ask out loud, the answer lands. A locate ping rings
+  // out; the place resolves in hero type.
+  Glass.prototype._waypath = function (card, t) {
+    var c = this.ctx, u = this._u(card, t, 0.85), dy = (1 - u) * 10;
+    var pu = (t - (card._in == null ? t : card._in)) % 1.6 / 1.6;   // repeating ping
+    c.strokeStyle = rgba(C.teal, (1 - pu) * 0.5 * u); c.lineWidth = 1.5;
+    c.beginPath(); c.arc(CX, 78, 8 + pu * 30, 0, Math.PI * 2); c.stroke();
+    this._dotC(CX, 78, 3, C.teal, u);
+    this._eyebrow(card.eyebrow || "LUCID RECALL", C.teal, u);
+    var lines = this._wrap(String(card.title || ""), 12).slice(0, 2), y = lines.length > 1 ? 118 : 132;
+    for (var i = 0; i < lines.length; i++) { this._ta(lines[i], CX, y + dy, "xl", C.text, u); y += 34; }
+    if (card.cap) this._ta(card.cap, CX, y + 6 + dy, "md", C.teal, u);
+    if (card.ghost) this._ta(this._clip(card.ghost, 26), CX, 202 + dy, "xs", C.ghost, u * 0.9);
+  };
+
+  // Keep — a promise drifts toward the rim of sight and glows as its time
+  // nears. Coral throughout; the drift IS the animation.
+  Glass.prototype._keep = function (card, t) {
+    var c = this.ctx, u = this._u(card, t, 0.9), dy = (1 - u) * 10;
+    // the promise token: eases from center out toward the upper-right rim,
+    // trailing a rail, then holds there with a breathing bloom.
+    var d = this._u(card, t, 1.15);
+    var tx = CX + d * 78, ty = 128 - d * 66;
+    c.strokeStyle = rgba(C.coral, 0.35 * u); c.lineWidth = 1;   // the drift rail
+    c.beginPath(); c.moveTo(CX, 128); c.lineTo(tx, ty); c.stroke();
+    var glow = (0.6 + 0.4 * Math.sin(t * 3)) * (0.4 + 0.6 * d);
+    c.fillStyle = rgba(C.coral, 0.18 * glow); c.beginPath(); c.arc(tx, ty, 13, 0, Math.PI * 2); c.fill();
+    this._dotC(tx, ty, 4, C.coral, 1);
+    this._eyebrow(card.eyebrow || "DRIFT DETECTED", C.coral, u);
+    this._ta(String(card.title || ""), CX, 132 + dy, "xl", C.text, u);
+    if (card.cap) this._ta(card.cap, CX, 162 + dy, "md", C.coral, u);
+    if (card.ghost) this._ta(card.ghost, CX, 188 + dy, "sm", C.text2, u);
+  };
+
+  // Rosetta — a menu you can't read reads back in your own words, live, on
+  // device. The translated line fades up as the source dims away.
+  Glass.prototype._rosetta = function (card, t) {
+    var u = this._u(card, t, 0.9), dy = (1 - u) * 10;
+    this._eyebrow(card.eyebrow || "ROSETTA · ES → EN", C.teal, u);
+    var lines = this._wrap(String(card.title || ""), 18).slice(0, 3), y = lines.length > 1 ? 118 : 132;
+    for (var i = 0; i < lines.length; i++) { this._ta(lines[i], CX, y + dy, "lg", C.text, u); y += 30; }
+    if (card.cap) this._ta(card.cap, CX, y + 8 + dy, "md", C.text2, u);
+    if (card.ghost) this._ta(this._clip(card.ghost, 26), CX, 202 + dy, "xs", C.ghost, u * 0.9);
+  };
+
+  Glass.prototype._dotC = function (x, y, r, hex, a) {
+    var c = this.ctx; c.fillStyle = rgba(hex, a); c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+    c.fillStyle = rgba(hex, 0.2 * a); c.beginPath(); c.arc(x, y, r + 4, 0, Math.PI * 2); c.fill();
+  };
+
+  // Public seam: render a specific World-lens card and (re)play its intro.
+  // `instant` skips the animation (reduced-motion / a static poster frame).
+  Glass.prototype.show = function (type, data, instant) {
+    var card = { type: type };
+    if (data) for (var k in data) if (data.hasOwnProperty(k)) card[k] = data[k];
+    card.shownAt = now();
+    card._in = instant ? -999 : (now() - this._t0);
+    this.sim.card = card; this.sim.figment = null; this.sim.incognito = false;
+    return card;
   };
   Glass.prototype._clip = function (s, n) { return s.length <= n ? s : s.slice(0, n - 1) + "…"; };
 

@@ -19,8 +19,19 @@ def _seeded_db():
 
 
 # --- memory: local embedder falls back to the deterministic mock -------------
-def test_local_embedder_fallback():
+def test_local_embedder_fallback(monkeypatch):
+    # Force the "sentence-transformers not installed" branch explicitly (the
+    # module-global _HAS_ST flag in embedder_local.py) instead of relying on
+    # the package actually being absent: with the optional dep installed
+    # (issue #449), LocalEmbeddingProvider used to load the real 384-d MiniLM
+    # model here and this assertion (pinned to the 32-d mock width) failed
+    # for environment reasons, not a real regression. Mirrors
+    # test_embedder_local_real.py::TestMockFallback
+    # .test_forced_unavailable_degrades_to_mock_without_raising, which proves
+    # the same _HAS_ST guard in an environment where the dep IS installed.
+    from dreamlayer.memory import embedder_local
     from dreamlayer.memory.embedder_local import LocalEmbeddingProvider
+    monkeypatch.setattr(embedder_local, "_HAS_ST", False)
     emb = LocalEmbeddingProvider()
     v = emb.embed("snake plant")
     assert isinstance(v, list) and len(v) == MockEmbeddingProvider.DIM
@@ -83,13 +94,35 @@ def test_memory_doc_fallback():
 
 
 # --- voice: VAD energy fallback; ASR empty fallback --------------------------
-def test_vad_and_asr_fallback():
+def test_vad_and_asr_fallback(monkeypatch):
+    # Force the "silero-vad not installed" branch explicitly (the module-global
+    # _HAS_SILERO flag in vad_gate.py) instead of relying on the package
+    # actually being absent: with silero-vad installed (issue #460), is_speech()
+    # preferred the real loaded model here and it correctly classified this
+    # alternating-tone burst as NOT speech, failing the energy-fallback
+    # assertion below for environment reasons, not a real regression. Mirrors
+    # test_voice_pipeline_real.py::TestVADFallback
+    # .test_forced_unavailable_uses_energy_heuristic, which proves the same
+    # _HAS_SILERO guard in an environment where the dep IS installed.
+    from dreamlayer.orchestrator import vad_gate
     from dreamlayer.orchestrator.vad_gate import SileroVADGate
-    from dreamlayer.orchestrator.asr_faster_whisper import FasterWhisperASR
+    monkeypatch.setattr(vad_gate, "_HAS_SILERO", False)
     gate = SileroVADGate(threshold=0.05)
     assert gate.is_speech([0.5, -0.6, 0.55, -0.5] * 40) is True   # loud
     assert gate.is_speech([0.0, 0.001, -0.001] * 40) is False     # silence
     assert gate.is_speech([]) is False
+
+    # Force the "faster-whisper not installed" branch explicitly (the
+    # module-global _HAS_FW flag in asr_faster_whisper.py): the "" result
+    # below only holds via the `_model is None` early return, and with
+    # faster-whisper installed (issue #460) transcribe() would exercise the
+    # real model against a nonexistent file instead, an unrelated code path.
+    # Mirrors test_voice_pipeline_real.py::TestASRFallback
+    # .test_forced_unavailable_returns_empty_without_raising, which proves the
+    # same _HAS_FW guard in an environment where the dep IS installed.
+    from dreamlayer.orchestrator import asr_faster_whisper
+    from dreamlayer.orchestrator.asr_faster_whisper import FasterWhisperASR
+    monkeypatch.setattr(asr_faster_whisper, "_HAS_FW", False)
     assert FasterWhisperASR().transcribe("nonexistent.wav") == ""  # no dep → ""
 
 

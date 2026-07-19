@@ -38,6 +38,23 @@ PROVIDER_PRESETS: dict[str, dict] = {
     "openrouter": {
         "label": "OpenRouter", "base_url": "https://openrouter.ai/api",
         "model": "openai/gpt-4o-mini", "needs_key": True, "wire": "openai"},
+    "groq": {
+        # Groq's OpenAI-compatible surface lives under /openai/v1 (docs:
+        # console.groq.com/docs/openai). The /v1 in the base means
+        # _build_request appends only /chat/completions, not /v1/chat/….
+        "label": "Groq", "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile", "needs_key": True, "wire": "openai"},
+    "together": {
+        # Together AI, OpenAI-compatible (docs: docs.together.ai).
+        "label": "Together AI", "base_url": "https://api.together.xyz/v1",
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "needs_key": True, "wire": "openai"},
+    "deepseek": {
+        # DeepSeek, OpenAI-compatible (docs: api-docs.deepseek.com). Host root
+        # like OpenAI — _build_request adds /v1/chat/completions, which DeepSeek
+        # accepts (its /v1 is a compat alias, unrelated to model version).
+        "label": "DeepSeek", "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat", "needs_key": True, "wire": "openai"},
     "ollama": {
         "label": "Ollama · local", "base_url": "http://localhost:11434",
         "model": "llama3.2", "needs_key": False, "wire": "openai"},
@@ -194,6 +211,12 @@ _LOCAL_AGENT_PROBES = (
     {"label": "Text-Gen-WebUI", "provider": "custom",
      "base_url": "http://localhost:5000/v1",
      "models_url": "http://localhost:5000/v1/models"},
+    {"label": "GPT4All", "provider": "custom",
+     "base_url": "http://localhost:4891/v1",
+     "models_url": "http://localhost:4891/v1/models"},
+    {"label": "KoboldCpp", "provider": "custom",
+     "base_url": "http://localhost:5001/v1",
+     "models_url": "http://localhost:5001/v1/models"},
 )
 
 
@@ -309,6 +332,15 @@ class OllamaBackend:
         prompt = (f"You are looking at what appears to be a {label}. In "
                   f"{detail}, say what it is and the single most useful thing "
                   f"to know about it. Be concrete.")
+        imgs = [image_b64] if image_b64 else None
+        return self._gen(self.config.ollama_vision_model, prompt, images=imgs)
+
+    def describe(self, prompt: str, image_b64: Optional[str]) -> str:
+        """Run the vision model against an arbitrary prompt — the low-level seam
+        the World Lens's structured recognizer uses to ask "what is this and
+        what does it read" and get back fields (a price, a title, an ISBN), not
+        just the fixed sentence :meth:`vision` produces. Same model, same wire;
+        the caller owns the prompt and parses the reply."""
         imgs = [image_b64] if image_b64 else None
         return self._gen(self.config.ollama_vision_model, prompt, images=imgs)
 

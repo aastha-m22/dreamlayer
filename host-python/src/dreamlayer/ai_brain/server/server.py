@@ -12,6 +12,7 @@ Serves the control panel and the API the phone and the panel both call:
     POST /dreamlayer/rc/feed        {text} → stream text into the live lens slot
     POST /dreamlayer/rc/emit        {tag, text} → lens emit → Brain → slot (ask)
     POST /dreamlayer/brain/explain  {label, image?, want?} → Answer
+    POST /dreamlayer/brain/look     {image?|label, attrs?, lens?} → World-lens panel
     GET  /dreamlayer/history        recent questions
 
 All /dreamlayer/* calls require the pairing token (when one is set); the
@@ -43,7 +44,8 @@ import time
 log = logging.getLogger("dreamlayer.ai_brain.server")
 
 from ..schema import Answer
-from .store import BrainConfig, QueryHistory, ActivityLog, replace_atomic
+from .store import (BrainConfig, QueryHistory, ActivityLog, replace_atomic,
+                    activity_receipt_signer)
 from .index import FileIndex
 from .backends import OllamaBackend, make_synthesizer, vision_answer, probe_ollama
 from .panel import render_panel
@@ -57,6 +59,51 @@ from .brain_reminders import ReminderOps
 from .brain_waypath import WaypathOps
 
 TOKEN_HEADER = "X-DreamLayer-Token"
+
+# --- HTTP request-surface hardening (audit 2026-07-17, "HTTP surface" B-→A) ---
+# Bounded reads, a per-connection socket timeout, a wall-clock body deadline,
+# and a worker-thread ceiling keep an authed/loopback caller from driving
+# unbounded memory, filling the disk, pinning a worker with slowloris (or a
+# byte-dribbling slow-POST), or exhausting the process's threads. All are module
+# constants so they are tunable in one place and assertable from tests.
+MAX_JSON_BODY = 16 * 1024 * 1024        # 16 MiB — cap for JSON bodies (_body/_raw)
+MAX_UPLOAD_BODY = 64 * 1024 * 1024      # 64 MiB — larger cap for file uploads
+SOCKET_TIMEOUT_S = 30.0                 # per-connection socket timeout — bounds BOTH recv and send
+MAX_REQUEST_BODY_SECONDS = 30.0         # wall-clock cap on reading a full body (anti slow-POST)
+MAX_REQUEST_HEADER_SECONDS = 30.0       # wall-clock cap on the request line + headers (anti slow-header slowloris)
+MAX_CONCURRENT_REQUESTS = 64            # worker-thread ceiling (anti thread-exhaustion)
+
+
+class _RequestTooLarge(Exception):
+    """A request body exceeded its size cap → mapped to HTTP 413. Carries the
+    cap so the handler can report it without re-deriving it."""
+
+    def __init__(self, limit: int):
+        super().__init__(f"request body exceeds {limit} bytes")
+        self.limit = limit
+
+
+class _BadContentLength(Exception):
+    """A malformed (non-numeric) Content-Length header → mapped to HTTP 400
+    instead of an unhandled int() ValueError surfacing as a 500 traceback."""
+
+
+class _LengthRequired(Exception):
+    """A body the server cannot length-delimit — a request carrying a
+    ``Transfer-Encoding`` (e.g. chunked) header but no usable Content-Length.
+    Python's http.server does not decode chunked bodies, so treating it as an
+    empty body silently accepted a real payload (a 0-byte /upload artifact
+    reported ok). Mapped to HTTP 411 Length Required (audit 2026-07-17,
+    refute-remediation finding 2)."""
+
+
+class _RequestTimeout(Exception):
+    """The request body did not fully arrive within MAX_REQUEST_BODY_SECONDS of
+    wall-clock time. The per-recv socket timeout only bounds a single stalled
+    recv; a slow-POST that dribbles a byte just under it resets that clock
+    indefinitely, pinning a worker thread and a semaphore slot. This
+    total-duration bound is what actually reclaims them. Mapped to HTTP 408
+    (audit 2026-07-17, refute-remediation finding 1)."""
 
 
 def authorize(token: str, provided, from_localhost: bool) -> bool:
@@ -140,9 +187,24 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
         # interleave a read-modify-write and lose or corrupt data (audit
         # 2026-07-14). Re-entrant so a helper can nest inside a held section.
         self._store_lock = threading.RLock()
+        # Serializes the cloud-egress counter (config.cloud_calls). The threaded
+        # server can run two cloud asks concurrently; a bare ``+= 1`` is a
+        # non-atomic load-add-store that loses a count under that race, so the
+        # ledger the panel promises ("every one is logged") could silently
+        # undercount. A dedicated Lock — not the store RLock, which guards the
+        # JSON files — keeps the critical section to just the increment
+        # (audit 2026-07-17). Touch the counter only via ``bump_cloud_calls``.
+        self._egress_lock = threading.Lock()
         self.config = BrainConfig.load(self.cfg_dir)
+        # Model supply-chain gate: when the wearer's posture is offline/incognito/
+        # LAN-only, set HF_HUB_OFFLINE &co process-wide so NO ML loader (embedder,
+        # ASR, speaker, CLIP…) can silently reach a CDN. One call gates every
+        # HuggingFace-stack loader at once; re-applied on posture change via
+        # _apply_model_posture(). Fail-safe: never raises, never blocks a load.
+        self._apply_model_posture()
         self.history = QueryHistory(self.cfg_dir)
-        self.activity = ActivityLog(self.cfg_dir)
+        self.activity = ActivityLog(
+            self.cfg_dir, signer=activity_receipt_signer(self.cfg_dir))
         self.index = FileIndex(self.config)
         # Platform sources: macOS reads Messages/Mail/Calendar.app; Windows
         # reads Thunderbird mbox + .ics feeds (windows_sources). Each module
@@ -194,8 +256,15 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
         # the user installs. Every package is validated (integrity + capability
         # scan + smoke test) before it's written; the panel and phone manage them.
         from ...plugins import PluginStore
+        from ...plugins.store import load_first_party_pins
+        # first_party = the reviewed first-party catalogue's content-hash pins
+        # (plugins/first_party.json). It lets the bundled connector plugins run
+        # in-process on Windows/Mac — where no kernel sandbox (bwrap/nsjail)
+        # exists, so an unpinned plugin would fail closed and never execute.
+        # Keyless: trust rides the reviewed source hash, not a signing secret.
         self.plugins = PluginStore(self.cfg_dir / "plugins",
-                                   host_capabilities=self.plugin_capabilities())
+                                   host_capabilities=self.plugin_capabilities(),
+                                   first_party=load_first_party_pins())
         # Juno's profile of you (name, interests, people, remembered prefs).
         # Built on the glasses hub from the conversation stream, then *pushed*
         # here so the phone can read it — the hub->Brain bridge. Just a mirror;
@@ -312,6 +381,7 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
             label = "?"
         if report.ok:
             self.activity.add("plugin", f"Installed plugin {label}")
+            self._invalidate_world_lens()   # a new connector can join a look
         return {"ok": report.ok, "errors": report.errors,
                 "warnings": report.warnings, "state": self.plugins_state()}
 
@@ -319,6 +389,7 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
         ok = self.plugins.remove(name)
         if ok:
             self.activity.add("plugin", f"Removed plugin {name}")
+            self._invalidate_world_lens()   # its provider should leave a look too
         return {"ok": ok, "state": self.plugins_state()}
 
     def reindex(self) -> dict:
@@ -412,9 +483,23 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
             self._backend = None
             self.index.synthesizer = None
             self.index.embedder = None
+        # the World lens closes over this backend; a rewire means the next look
+        # rebuilds against the new vision tier.
+        self._world_lens = None
 
     def save(self) -> None:
         self.config.save(self.cfg_dir)
+
+    def bump_cloud_calls(self, n: int = 1) -> None:
+        """Atomically advance the cloud-egress ledger (config.cloud_calls).
+
+        Every egress site — both ask paths and the endpoint-test probe — routes
+        its increment through here so the load-add-store runs under
+        ``_egress_lock`` and can't lose a count when two egress events race on
+        the threaded server (audit 2026-07-17). Small, targeted critical section:
+        just the increment; the surrounding activity-log + save stay outside."""
+        with self._egress_lock:
+            self.config.cloud_calls += n
 
     def apply_config(self, updates: dict) -> None:
         for k in ("model", "ollama_url", "ollama_chat_model",
@@ -432,6 +517,10 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
                 setattr(self.config, k, updates[k])
         self._wire_model()
         self.save()
+        # A posture change (network_mode / quiet_hours) re-arms the model fetch
+        # gate: flip to lan_only and HF_HUB_OFFLINE goes on before the next load.
+        if {"network_mode", "quiet_hours"} & set(updates):
+            self._apply_model_posture()
         # turning a sync on (or changing its filter) → pull immediately
         try:
             if updates.get("calendar_sync") or ("calendar_names" in updates and self.config.calendar_sync):
@@ -454,6 +543,16 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
         """Effective privacy shield: manual LAN-only OR a quiet-hours window."""
         from .store import in_quiet_hours
         return self.config.lan_only or in_quiet_hours(self.config.quiet_hours)
+
+    def _apply_model_posture(self) -> None:
+        """Set the process-wide HF offline flags to match the wearer's posture,
+        so ML loaders can't reach a CDN while offline/incognito. Fail-safe:
+        model_guard is optional and this never raises into the caller."""
+        try:
+            from ... import model_guard
+            model_guard.apply_offline_posture(self)
+        except Exception as exc:                    # pragma: no cover - defensive
+            log.debug("[brain] model posture gate skipped: %s", exc)
 
     def missing_folders(self) -> list:
         return [f for f in self.config.folders
@@ -510,7 +609,7 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
             # …then account for it before the request (mirrors _ask_cloud's
             # count-log-save-before-call ordering — reaching here means the
             # query is leaving the device).
-            self.config.cloud_calls += 1
+            self.bump_cloud_calls()
             self.activity.add("cloud-egress", f"Asked your API brain: {query[:70]}")
             self.save()
         try:
@@ -536,7 +635,7 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
         successful answers silently under-reported egress — a real gap for a
         product whose panel promises "every one is logged"."""
         from .backends import cloud_chat
-        self.config.cloud_calls += 1                    # the query is leaving now
+        self.bump_cloud_calls()                         # the query is leaving now
         self.activity.add("cloud-egress", f"Asked the cloud: {query[:70]}")
         self.save()
         try:
@@ -551,6 +650,28 @@ class Brain(RCOps, CalendarOps, SocialOps, ReminderOps, WaypathOps):
 
     def explain(self, label: str, image_b64, want: str) -> Optional[Answer]:
         return vision_answer(self._backend, label, image_b64, want)
+
+    def world_lens(self):
+        """The on-glass World lenses (Object Lens / Juno + TasteLens) run inside
+        this Brain — the pre-hardware stand-in a phone photo looks through
+        (ai_brain/server/world_lens.py). Built once and cached (loading installed
+        plugins isn't free); invalidated when a plugin or the model changes so a
+        fresh look picks up the new set. Returns None if it can't be built."""
+        wl = getattr(self, "_world_lens", None)
+        if wl is None:
+            try:
+                from .world_lens import build_world_lens
+                wl = build_world_lens(self)
+            except Exception:
+                log.warning("world lens unavailable", exc_info=True)
+                wl = None
+            self._world_lens = wl
+        return wl
+
+    def _invalidate_world_lens(self) -> None:
+        """Drop the cached World lens so the next look rebuilds it — call after a
+        plugin install/remove or a model rewire changes what a look can do."""
+        self._world_lens = None
 
     def summarize(self, text: str, max_chars: int = 220) -> str:
         """One-glance summary of a long email. Uses the local model when there
@@ -1456,9 +1577,13 @@ def _install_pack(brain: Brain, pack_key: str) -> dict:
 
 
 def make_brain_server(brain: Brain, host: str = "127.0.0.1",
-                      port: int = 7777) -> ThreadingHTTPServer:
+                      port: int = 7777, *,
+                      tls_port: "Optional[int]" = None) -> ThreadingHTTPServer:
     # the token is read live in _authed (via authorize) so rotation applies;
-    # nothing here needs to close over it.
+    # nothing here needs to close over it. tls_port is advertisement only —
+    # it tells /dreamlayer/live/link that a sibling https listener exists
+    # (started by __main__ --tls) so the panel can hand out the secure link
+    # a phone browser needs before it may open its camera.
 
     # Brute-force lockout on the token endpoint: without it a LAN attacker could
     # grind the Brain token unthrottled (audit 2026-07-14 — the limiter existed
@@ -1469,6 +1594,72 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
                                    lockout_s=300.0)
 
     class Handler(BaseHTTPRequestHandler):
+        # Per-connection socket timeout: StreamRequestHandler.setup() applies
+        # this via self.connection.settimeout(), so a slowloris client that opens
+        # a socket and dribbles (or never finishes) its request can no longer pin
+        # a worker thread forever — the read raises socket.timeout and the worker
+        # is reclaimed (audit 2026-07-17, anti-slowloris). settimeout() bounds
+        # BOTH recv and send, and a single 30 s bound is deliberately kept for
+        # both. A more generous SEND window buys nothing real: the only large
+        # responses (a /backup export, static assets) are _from_localhost()-only
+        # and drain sub-second over loopback/LAN, while the genuinely remote
+        # (phone) endpoints return small JSON — no real workload needs >30 s to
+        # write. But a flat multi-minute send bound WOULD arm a slow-read DoS: a
+        # client that triggers a large response and then STOPS READING pins a
+        # worker thread blocked in sendall() — holding a semaphore slot — for the
+        # whole window, so ~64 non-reading clients exhaust the pool for that long.
+        # Bounding send at 30 s too caps that pin at 30 s (audit 2026-07-18,
+        # reverted the send-timeout bump — slow-read pool-exhaustion DoS).
+        #
+        # But `timeout` is only a PER-RECV bound. The request line + headers are
+        # read by the stdlib (readline + parse_request) BEFORE do_*/auth runs, so
+        # a slowloris that dribbles one header byte just under the 30 s per-recv
+        # window resets that clock forever — pinning a worker AND a bounded
+        # semaphore slot entirely PRE-AUTH. A refute pass (2026-07-18) showed ~64
+        # such connections lock the whole server out at near-zero bandwidth; the
+        # bounded semaphore turns it into a clean deterministic lockout. The body
+        # read already defends this with a MAX_REQUEST_BODY_SECONDS wall-clock
+        # cap (_read_capped); handle_one_request below arms the same total-time
+        # guard around the pre-dispatch header phase.
+        timeout = SOCKET_TIMEOUT_S
+
+        def handle_one_request(self):
+            # Wall-clock bound on the request line + headers, disarmed the instant
+            # parsing completes (before the handler's own — legitimately long —
+            # work and the separately-bounded response write). A Timer fires from
+            # another thread and shuts the socket down, unblocking the dribbling
+            # recv so the worker (and its semaphore slot) is reclaimed.
+            watchdog = threading.Timer(MAX_REQUEST_HEADER_SECONDS,
+                                       self._abort_slow_request)
+            watchdog.daemon = True
+            self._header_watchdog = watchdog
+            watchdog.start()
+            try:
+                super().handle_one_request()
+            finally:
+                watchdog.cancel()
+                self._header_watchdog = None
+
+        def parse_request(self):
+            ok = super().parse_request()
+            # Request line + headers are fully read now — disarm the header
+            # watchdog so it can't fire during dispatch/handler work or the body
+            # read (which carries its own MAX_REQUEST_BODY_SECONDS deadline).
+            wd = getattr(self, "_header_watchdog", None)
+            if wd is not None:
+                wd.cancel()
+                self._header_watchdog = None
+            return ok
+
+        def _abort_slow_request(self):
+            # Runs on the Timer thread: force the blocked header read to return by
+            # shutting the connection down. Best-effort — the socket may already be
+            # torn down, or the request may have just completed.
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
         def log_message(self, *a):
             pass
 
@@ -1546,17 +1737,83 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             host = (self.headers.get("Host") or "").lower()
             return bool(origin_host) and origin_host == host
 
+        def _read_capped(self, max_bytes: int) -> bytes:
+            """Read the request body, bounded by ``max_bytes`` AND a wall-clock
+            deadline.
+
+            An authed/loopback caller must not be able to drive unbounded memory
+            or fill the disk, so the whole body is never allocated first: a
+            Content-Length that declares more than the cap is refused *before a
+            single byte is read* (→ 413), and an accepted body is read at most
+            up to the cap (which the declared length is already ≤). A malformed
+            (non-numeric) Content-Length is rejected as 400 rather than raising
+            an unhandled ``int()`` ValueError deep in a handler as a 500
+            (audit 2026-07-17).
+
+            Two subtler defects a refute pass confirmed (audit 2026-07-17):
+
+            * Slow-POST (finding 1): the per-recv socket timeout is an
+              *inactivity* timeout — a client that dribbles one byte just under
+              it resets that clock forever, pinning a worker + a semaphore slot.
+              So the body is read in bounded slices (``read1`` → one recv each)
+              against a MAX_REQUEST_BODY_SECONDS wall-clock deadline; exceeding
+              it aborts the read (→ 408) regardless of per-recv activity. The
+              per-recv timeout still bounds a single stalled recv; this ADDS a
+              total-duration bound and leaves a steady upload that finishes
+              within the cap untouched.
+
+            * Undelimitable body (finding 2): Python's http.server does not decode
+              chunked bodies, so a POST carrying a ``Transfer-Encoding`` header
+              but no usable Content-Length would otherwise return b"" — silently
+              accepted as empty (a 0-byte /upload artifact reported ok). A body we
+              cannot length-delimit is rejected (→ 411) instead of forged into an
+              empty one. A genuinely empty body (no Transfer-Encoding, absent or
+              zero Content-Length) stays a valid empty body."""
+            raw = self.headers.get("Content-Length")
+            if not raw:
+                # A body was indicated but can't be length-delimited (chunked /
+                # any Transfer-Encoding with no Content-Length): reject rather
+                # than forge an empty body. A plain bodyless POST (no
+                # Transfer-Encoding) is still a valid empty body.
+                if self.headers.get("Transfer-Encoding"):
+                    raise _LengthRequired()
+                return b""
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                raise _BadContentLength()
+            if n <= 0:
+                return b""
+            if n > max_bytes:
+                raise _RequestTooLarge(max_bytes)   # oversize — nothing read
+            # n is already ≤ the cap here, so this allocates at most the cap.
+            # Read in bounded slices against a wall-clock deadline: ``read1``
+            # does at most one recv and returns whatever arrived, so the deadline
+            # is re-checked after every recv instead of blocking inside a single
+            # read(n) that a byte-dribbling slow-POST could stretch indefinitely
+            # (each dribbled byte otherwise resets the per-recv socket timeout).
+            deadline = time.monotonic() + MAX_REQUEST_BODY_SECONDS
+            chunks = []
+            remaining = n
+            while remaining > 0:
+                if time.monotonic() > deadline:
+                    raise _RequestTimeout()
+                chunk = self.rfile.read1(min(remaining, 65536))
+                if not chunk:
+                    break                            # client closed early — take what came
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
         def _body(self) -> dict:
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(n) if n else b""
+            raw = self._read_capped(MAX_JSON_BODY)
             try:
                 return json.loads(raw.decode("utf-8")) if raw else {}
             except (ValueError, UnicodeDecodeError):
                 return {}
 
-        def _raw(self) -> bytes:
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            return self.rfile.read(n) if n else b""
+        def _raw(self, max_bytes: int = MAX_JSON_BODY) -> bytes:
+            return self._read_capped(max_bytes)
 
         # -- GET handlers (one named method per endpoint) ---------------
         # Public handlers run BEFORE the auth gate (static, same-origin assets
@@ -1585,6 +1842,35 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _get_live(self, path, qs):
+            """The Live Lens — a phone browser becomes the glasses (live.py).
+            PUBLIC like the builder, but stricter: this HTML embeds NO token in
+            any case; the credential rides the URL fragment of the link/QR the
+            panel hands out (see _get_live_link), so the page itself is inert."""
+            import secrets
+            from .live import render_live
+            # Per-response nonce for the sole inline <style>/<script>, so a strict
+            # CSP can permit THIS page's own inline code while blocking any
+            # injected <script>/<img onerror> from executing — the token lives in
+            # the page's sessionStorage, so an innerHTML regression here would be
+            # token theft; the CSP is the backstop the page had none of (refute
+            # 2026-07-18). default-src 'none' + connect-src 'self' also pins the
+            # "zero external fetches" claim: no off-origin load can slip in.
+            nonce = secrets.token_urlsafe(16)
+            body = render_live(nonce).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; "
+                f"script-src 'nonce-{nonce}'; "
+                f"style-src 'nonce-{nonce}'; "
+                "img-src 'self' data: blob:; media-src 'self' blob:; "
+                "connect-src 'self'; base-uri 'none'; form-action 'none'")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1719,6 +2005,13 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             """Newest-first activity feed (questions + actions)."""
             self._json(200, {"items": _activity_feed(brain, 40)})
 
+        def _get_receipt(self, path, qs):
+            """A verifiable privacy receipt: the tamper-evident activity records
+            (seq/prev/sig), the Ed25519 public key to check them against, and
+            this Brain's own verify() result — so a wearer or a bystander can
+            independently confirm what the Brain did was not altered."""
+            self._json(200, brain.activity.receipt())
+
         def _get_calendar(self, path, qs):
             """Upcoming agenda events."""
             self._json(200, {"items": brain.calendar()})
@@ -1849,10 +2142,41 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             from .qr import to_svg
             self._json(200, {"code": code, "url": url, "qr": to_svg(code)})
 
+        def _get_live_link(self, path, qs):
+            """The Live Lens link + QR — only handed to the local panel, exactly
+            like the pairing code (the link carries the token, so the link IS
+            the credential). The token rides the URL FRAGMENT, which browsers
+            never send over the wire, so it can't leak into logs. When --tls is
+            on we hand out the https link — the one whose secure context lets a
+            phone browser open its camera."""
+            if not self._from_localhost():
+                self._json(403, {"error": "the Live Lens link is local-only"}); return
+            port = self.server.server_address[1]
+            ip = lan_ip()
+            host = ip if ip and ip != "127.0.0.1" else "127.0.0.1"
+            frag = "#t=" + urllib.parse.quote(brain.config.token or "")
+            http_url = f"http://{host}:{port}/dreamlayer/live"
+            tls_port = getattr(self.server, "tls_port", None)
+            https_url = (f"https://{host}:{tls_port}/dreamlayer/live"
+                         if tls_port else "")
+            best = (https_url or http_url) + frag
+            from .qr import to_svg
+            brain.activity.add("look", "Generated a Live Lens link")
+            self._json(200, {
+                "url": best, "http_url": http_url + frag,
+                "https": bool(https_url),
+                "note": ("scan with the phone camera — accept the one-time "
+                         "certificate warning (it is this Brain's own)"
+                         if https_url else
+                         "cameras need a secure page: restart the Brain with "
+                         "--tls for the https link; asking works over http"),
+                "qr": to_svg(best)})
+
         # -- GET route table --------------------------------------------
         # exact-path public routes, resolved BEFORE the auth gate
         _GET_PUBLIC = {
             "/": _get_root,
+            "/dreamlayer/live": _get_live,
             "/dreamlayer/build": _get_builder,
             "/dreamlayer/build/figment.js": _get_builder_asset,
             "/dreamlayer/build/qr.js": _get_builder_asset,
@@ -1875,6 +2199,7 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             "/dreamlayer/cloud": _get_cloud,
             "/dreamlayer/memory/file": _get_memory_file,
             "/dreamlayer/history": _get_history,
+            "/dreamlayer/receipt": _get_receipt,
             "/dreamlayer/calendar": _get_calendar,
             "/dreamlayer/people": _get_people,
             "/dreamlayer/calendars": _get_calendars,
@@ -1895,6 +2220,7 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             "/dreamlayer/api/discover": _get_api_discover,
             "/dreamlayer/browse": _get_browse,
             "/dreamlayer/pair": _get_pair,
+            "/dreamlayer/live/link": _get_live_link,
         }
 
         # -- routing ----------------------------------------------------
@@ -1995,7 +2321,7 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             """Drag-drop a file into a watched folder, then reindex."""
             folder = (qs.get("folder", [""])[0])
             name = Path(qs.get("name", ["dropped.txt"])[0]).name
-            ok = _write_upload(brain, folder, name, self._raw())
+            ok = _write_upload(brain, folder, name, self._raw(MAX_UPLOAD_BODY))
             if ok:
                 brain.activity.add("upload", f"Added {name}")
             brain.reindex()
@@ -2009,6 +2335,18 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             b = self._body()
             ans = brain.ask(b.get("query", ""), no_cloud=bool(b.get("no_cloud")))
             self._json(200, _answer_json(ans))
+
+        def _post_live_look(self, path, qs):
+            """One Live Lens look: a JPEG frame in, a budget-clamped HUD card
+            out — the SAME unified pipeline as /brain/look (live.world_look).
+            The frame is decoded in memory and never persisted; under the
+            wearer's egress shield the look is local-only (classifier ladder,
+            zero egress, no trace — test_live_lens pins it), and outside it the
+            plugin providers see extracted fields, never pixels. The frame cap
+            rides the same 413-before-read machinery as every body."""
+            from . import live as live_mod
+            data = self._raw(live_mod.MAX_FRAME_BYTES)
+            self._json(200, live_mod.look(brain, data))
 
         def _post_plugins_install(self, path, qs):
             """Install a plugin from the posted descriptor."""
@@ -2209,6 +2547,69 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
                                 b.get("want", "quick"))
             self._json(200, _answer_json(ans))
 
+        def _post_brain_look(self, path, qs):
+            """Look at a photo → a World-lens panel — the on-glass experience run
+            in the Brain so a phone photo stands in for the glasses.
+
+            Body: {image? (base64), label?, attrs?, lens? ("object"|"taste"),
+            facet?, confidence?, budget?}. The image mode rides live.world_look —
+            THE unified pipeline shared with the browser's Live Lens — so both
+            surfaces are one thing: full plugin panel outside the egress shield,
+            an honest local-only look inside it, and the same budget-clamped
+            glass `lines` from the one formatter. The `label`/taste modes
+            exercise plugin providers directly and stay veiled under the shield.
+            Returns {ok, panel|card, lines?} or an honest {ok:false, reason}."""
+            from ...object_lens.schema import ObjectSighting
+            from ...object_lens.vision_recognizer import b64_to_frame
+            from . import live as live_mod
+            b = self._body()
+            lens = str(b.get("lens", "object") or "object")
+            facet = b.get("facet") or None
+            label = str(b.get("label", "") or "").strip()
+            if lens == "object" and not label and not facet:
+                out = live_mod.world_look(brain, b64_to_frame(b.get("image")))
+                out["lens"] = "object"
+                self._json(200, out)
+                return
+            wl = brain.world_lens()
+            if wl is None:
+                self._json(200, {"ok": False, "reason": "vision lens unavailable"})
+                return
+            if wl.veiled():
+                self._json(200, {"ok": False, "veiled": True,
+                                 "reason": "Incognito — Juno isn't looking."})
+                return
+            if lens == "taste":
+                ranking = wl.taste(b64_to_frame(b.get("image")),
+                                   budget=b.get("budget"))
+                if ranking is None or ranking.unavailable:
+                    self._json(200, {"ok": False,
+                                     "reason": "couldn't read a shelf here"})
+                    return
+                from ...hud import cards
+                self._json(200, {"ok": True, "lens": "taste",
+                                 "card": cards.taste(ranking, unavailable=False)})
+                return
+            # object lens (Juno) — deterministic label mode / an explicit facet
+            if label:
+                attrs = b.get("attrs")
+                try:
+                    conf = float(b.get("confidence", 0.9))
+                except (TypeError, ValueError):
+                    conf = 0.9
+                sighting = ObjectSighting(
+                    label=label, confidence=max(0.0, min(1.0, conf)),
+                    attributes=attrs if isinstance(attrs, dict) else {})
+                panel = wl.look_sighting(sighting, facet=facet)
+            else:
+                panel = wl.look(b64_to_frame(b.get("image")), facet=facet)
+            if panel is None:
+                self._json(200, {"ok": False, "reason": "couldn't make it out"})
+                return
+            card = panel.to_hud_card()
+            self._json(200, {"ok": True, "lens": "object", "panel": card,
+                             "lines": live_mod.panel_lines(card)})
+
         def _post_reindex(self, path, qs):
             """Re-index all watched folders."""
             stats = brain.reindex()
@@ -2242,10 +2643,42 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
                 brain.activity.add("config", f"Cleared {what}")
             self._json(200, {"ok": True, "stats": brain.index.stats()})
 
+        def _account_remote_test(self, provider, base, label) -> "dict | None":
+            """A 'Test connection' probe still leaves the device when the
+            endpoint is REMOTE — so it must obey the SAME rule as a real query:
+            refused while incognito, and counted+logged as egress otherwise.
+            Before this, the test path fired a fixed prompt PLUS the wearer's API
+            key to a public host uncounted and even while incognito, directly
+            contradicting the panel's promise ('counted and logged … silenced
+            while you're incognito'). Locality is judged on the EFFECTIVE base
+            (a blank base_url falls back to the provider preset, which is
+            remote), so a blank-but-preset endpoint isn't under-counted. Returns
+            a refusal dict to short-circuit, or None to proceed; a local/unset
+            endpoint is not egress. (audit 2026-07-15, sibling-call-site of
+            _ask_cloud / _ask_primary_api.)"""
+            from .backends import is_local_endpoint, PROVIDER_PRESETS
+            preset = PROVIDER_PRESETS.get(provider or "custom",
+                                          PROVIDER_PRESETS["custom"])
+            effective = (base or "").strip() or preset.get("base_url", "")
+            if not effective or is_local_endpoint(effective):
+                return None                     # on-device / unset: free
+            if brain.incognito_now():
+                return {"ok": False, "error":
+                        "a remote endpoint isn't tested while you're incognito"}
+            brain.bump_cloud_calls()
+            brain.activity.add("cloud-egress", label)
+            brain.save()
+            return None
+
         def _post_cloud_test(self, path, qs):
             """Probe the configured cloud provider — local-only."""
             if not self._from_localhost():
                 self._json(403, {"error": "local-only"}); return
+            refusal = self._account_remote_test(
+                brain.config.cloud_provider, brain.config.cloud_base_url,
+                "Tested the cloud endpoint")
+            if refusal is not None:
+                self._json(200, refusal); return
             from .backends import cloud_test
             self._json(200, cloud_test(brain.config))
 
@@ -2253,6 +2686,11 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             """Probe the wearer's primary API brain (api_* config) — local-only."""
             if not self._from_localhost():
                 self._json(403, {"error": "local-only"}); return
+            refusal = self._account_remote_test(
+                brain.config.api_provider, brain.config.api_base_url,
+                "Tested your API brain")
+            if refusal is not None:
+                self._json(200, refusal); return
             from .backends import api_test
             self._json(200, api_test(brain.config))
 
@@ -2327,6 +2765,7 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             "/dreamlayer/model/pull": _post_model_pull,
             "/dreamlayer/people": _post_people,
             "/dreamlayer/brain/explain": _post_brain_explain,
+            "/dreamlayer/brain/look": _post_brain_look,
             "/dreamlayer/reindex": _post_reindex,
             "/dreamlayer/token/rotate": _post_token_rotate,
             "/dreamlayer/clear": _post_clear,
@@ -2335,6 +2774,7 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
             "/dreamlayer/restore": _post_restore,
             "/dreamlayer/message/draft": _post_message_draft,
             "/dreamlayer/message/send": _post_message_send,
+            "/dreamlayer/live/look": _post_live_look,
         }
         # prefix/dynamic routes (ordered fallback for non-exact paths)
         _POST_ROUTES_PREFIX = [
@@ -2359,9 +2799,36 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
                         handler = h; break
             if handler is None:
                 self._json(404, {"error": "not found"}); return
-            handler(self, path, qs)
+            # The body is read lazily inside each handler (via _body/_raw), so
+            # the size/format guards land here where the response can still be
+            # chosen: an oversize body is a 413 and a malformed Content-Length a
+            # 400 — never an unhandled 500 (audit 2026-07-17).
+            try:
+                handler(self, path, qs)
+            except _RequestTooLarge as exc:
+                self.close_connection = True   # don't drain the oversize body
+                self._json(413, {"error": "request body too large",
+                                 "limit": exc.limit})
+            except _BadContentLength:
+                self.close_connection = True
+                self._json(400, {"error": "invalid Content-Length"})
+            except _LengthRequired:
+                # a body we can't length-delimit (chunked, no Content-Length):
+                # demand a length instead of writing a phantom empty body.
+                self.close_connection = True
+                self._json(411, {"error": "Content-Length required"})
+            except _RequestTimeout:
+                # the body didn't fully arrive within the wall-clock deadline —
+                # a byte-dribbling slow-POST; abort so the worker + slot free up.
+                self.close_connection = True
+                self._json(408, {"error": "request body read timed out"})
 
     class _BrainServer(ThreadingHTTPServer):
+        # sibling https listener's port (set by the factory when __main__
+        # started one with --tls) — advertised by /dreamlayer/live/link so the
+        # panel can hand out the secure URL a phone camera requires.
+        tls_port: "Optional[int]" = None
+
         # The stdlib default (allow_reuse_address = 1) is a POSIX convenience:
         # it lets a restart rebind through TIME_WAIT. On Windows SO_REUSEADDR
         # means something else entirely — "bind even if another socket is
@@ -2371,7 +2838,34 @@ def make_brain_server(brain: Brain, host: str = "127.0.0.1",
         # clean close, so nothing is lost.
         allow_reuse_address = os.name != "nt"
 
-    return _BrainServer((host, port), Handler)
+        # Bounded concurrency: ThreadingHTTPServer spawns one thread per
+        # connection unbounded, so a flood of sockets could exhaust the
+        # process's threads (thread-exhaustion DoS). A BoundedSemaphore caps the
+        # in-flight worker count — the accept loop blocks (backpressure) once the
+        # ceiling is reached instead of spawning without limit, and each worker
+        # releases its slot when it finishes (audit 2026-07-17). Sized well above
+        # normal panel/phone load so healthy traffic never queues.
+        _slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+
+        def process_request(self, request, client_address):
+            # Runs in the serve_forever accept loop: acquiring here throttles new
+            # connections when the pool is saturated rather than in the worker.
+            self._slots.acquire()
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self._slots.release()   # thread never started — don't leak a slot
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self._slots.release()
+
+    server = _BrainServer((host, port), Handler)
+    server.tls_port = tls_port          # advertised by /dreamlayer/live/link
+    return server
 
 
 def _write_upload(brain: Brain, folder: str, name: str, data: bytes) -> bool:

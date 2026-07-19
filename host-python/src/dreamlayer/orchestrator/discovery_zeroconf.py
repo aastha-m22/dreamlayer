@@ -12,7 +12,7 @@ import socket
 log = logging.getLogger("dreamlayer.discovery")
 
 try:
-    from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser  # type: ignore
+    from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser, ServiceListener  # type: ignore
     _HAS_ZC = True
 except ImportError:
     _HAS_ZC = False
@@ -33,9 +33,17 @@ class Discovery:
         try:
             self._zc = Zeroconf()
             addr = socket.inet_aton(socket.gethostbyname(socket.gethostname()))
+            # Advertise presence/host/port ONLY — never the pairing token. A
+            # zeroconf TXT record is unauthenticated multicast: any device (or a
+            # passive listener) on the LAN reads it in the clear, so putting the
+            # secret here defeats the pairing it's meant to protect. Discovery
+            # returns {name, host, port}; the token is exchanged over the
+            # authenticated pairing channel, not broadcast (audit 2026-07-15).
+            # `token` stays in the signature for call-compatibility but is not
+            # published.
             self._info = ServiceInfo(
                 SERVICE, f"{name}.{SERVICE}", addresses=[addr], port=port,
-                properties={"token": token} if token else {})
+                properties={})
             self._zc.register_service(self._info)
             return True
         except Exception as exc:
@@ -58,7 +66,11 @@ class Discovery:
             return []
         found: list[dict] = []
 
-        class _L:
+        # _L is only defined/instantiated on the _HAS_ZC path (guarded above),
+        # so subclassing ServiceListener never runs when the dep is absent —
+        # the module still imports cleanly there. With the dep present it makes
+        # _L satisfy zeroconf's ServiceListener protocol for ServiceBrowser.
+        class _L(ServiceListener):
             def add_service(self, zc, type_, name):
                 try:
                     info = zc.get_service_info(type_, name)

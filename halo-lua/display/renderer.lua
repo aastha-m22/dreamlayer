@@ -221,6 +221,100 @@ local function shield_glyph(cx,cy,size,color,bars)
 end
 
 -- ---------------------------------------------------------------------------
+-- Juno, as pixels — the desk accessory earns her seat on the glass.
+-- 32x32, quantized from landing/assets/juno/juno_icon32.png into three
+-- palette levels: 1 outline, 2 body, 3 wings and highlights. Keep the
+-- three copies in lockstep: here, hud/renderer.py (_JUNO_ROWS) and
+-- landing/assets/sim/halo-sim.js (JUNO_ROWS).
+-- ---------------------------------------------------------------------------
+
+local JUNO_ROWS = {
+  ".......................1........",
+  "......................121.......",
+  ".................1221122........",
+  ".................1222322........",
+  "...............1.1232121........",
+  "..1221.......1222222212...1221..",
+  "..23332.....122233232....23332..",
+  "..1333331...122332212..2333331..",
+  "...2333332..12232211113333332...",
+  "...133333331.1232...233333331...",
+  "....133333332.22..1233333331....",
+  ".....1233333323322233333321.....",
+  ".......223332333322333322.......",
+  "..........222333232221..........",
+  ".......12232233323233221........",
+  ".....133333223331233333331......",
+  "....23333321233321333333332.....",
+  "....3333322.233331.23333333.....",
+  ".....22221.1333332...12222......",
+  "...........13333331.............",
+  "...........23233332.............",
+  "...........2223333321...........",
+  "...........222233333322.........",
+  "...........1222223333331........",
+  "............223222333333........",
+  "............122222133232........",
+  ".............222.2111.1.........",
+  "..............12222.............",
+  "...............2222.............",
+  "...............2211.............",
+  "...............11...............",
+  "................................",
+}
+
+local _juno_spans  -- horizontal runs {y, x, w, level}, built once
+local function juno_spans()
+  if _juno_spans then return _juno_spans end
+  _juno_spans = {}
+  for y = 1, #JUNO_ROWS do
+    local row = JUNO_ROWS[y]
+    local x = 1
+    while x <= #row do
+      local ch = row:sub(x, x)
+      if ch == "." then
+        x = x + 1
+      else
+        local x2 = x
+        while x2 < #row and row:sub(x2 + 1, x2 + 1) == ch do x2 = x2 + 1 end
+        _juno_spans[#_juno_spans + 1] = { y - 1, x - 1, x2 - x + 1, ch + 0 }
+        x = x2 + 1
+      end
+    end
+  end
+  return _juno_spans
+end
+
+-- Draw Juno centred on (cx, cy) at integer pixel scale `px` (pixel art
+-- never tweens — scale in whole steps). `colors` maps level -> palette
+-- token; a nil level is skipped.
+local function draw_juno(cx, cy, px, colors)
+  if not HAS_FRAME then return end
+  local ox, oy = cx - 16 * px, cy - 16 * px
+  for _, s in ipairs(juno_spans()) do
+    local c = colors[s[4]]
+    if c then
+      frame.display.rect(ox + s[2] * px, oy + s[1] * px, s[3] * px, px, c, true)
+    end
+  end
+end
+
+-- Her liveries. Veil drops the outline level: gone dark, not re-lit.
+local JUNO_TEAL    = { P.accent_memory_dim, P.accent_memory, P.memory_trace }
+local JUNO_SUCCESS = { P.accent_success_dim, P.accent_success, P.accent_success }
+local JUNO_VEIL    = { [2] = P.accent_attention_dim, [3] = P.privacy_danger }
+
+-- The Platinum title-bar pinstripe, in the glass palette: three stacked
+-- hairlines (bright -> mid -> dim teal). A quiet bridge to the panel's
+-- pinstripe, drawn only in the eyebrow rule where it never meets body text.
+local function pinstripe_rule(x0, x1, y)
+  if not HAS_FRAME then return end
+  frame.display.line(x0, y,   x1, y,   P.memory_trace)
+  frame.display.line(x0, y+1, x1, y+1, P.accent_memory)
+  frame.display.line(x0, y+2, x1, y+2, P.accent_memory_dim)
+end
+
+-- ---------------------------------------------------------------------------
 -- Per-card draw functions  (t = eased 0→1 for enter/exit scaling)
 -- All radii are multiplied by `scale` = lerp(0.94, 1.0, t) during ENTER,
 -- or lerp(1.0, 0.0, t) during EXIT.
@@ -272,14 +366,9 @@ local function draw_ready(sc, enter_t, exit_t)
   local r3 = floor(36 * sc)
   local r4 = floor(48 * sc)
   if r<1 then return end
-  -- hex core
+  -- Juno at the core — the brain is listening, in person
   if layer_ok(enter_t, A.STAGGER_PRIMARY_MS) then
-    local pts={}
-    for i=0,5 do
-      local a=math.rad(60*i-30)
-      pts[#pts+1]={floor(CX+r*math.cos(a)),floor(CY+r*math.sin(a))}
-    end
-    closed_poly(pts, P.memory_trace)
+    draw_juno(CX, CY, 1, JUNO_TEAL)
   end
   -- rings (Solid: gradient strokes — same call count, living light)
   if layer_ok(enter_t, A.STAGGER_EYEBROW_MS) then
@@ -392,9 +481,8 @@ local function draw_loading(sc, enter_t, idle_t)
       local a0 = -90 + i * span + gap / 2
       arc(CX,CY,r, a0, a0 + span - gap, CHASE_BANDS[i % 3 + 1], 3)
     end
-    frame.display.circle(CX,CY,3,P.memory_trace,true)
-    frame.display.circle(CX,CY,floor(6*sc),P.accent_memory_dim,false)
-    MAT.bloom_ring(CX,CY,6,P.memory_trace)
+    -- Juno at the still centre — the thought the chase circles around
+    draw_juno(CX,CY,1,JUNO_TEAL)
   end
 end
 
@@ -520,8 +608,9 @@ local function draw_proactive_memory(card, sc, enter_t, exit_t)
   end
   if layer_ok(enter_t, A.STAGGER_PRIMARY_MS) then
     radial_rays(CX,CY-10, floor(5*sc),floor(52*sc), 5,P.memory_trace,2)
-    frame.display.circle(CX,CY-10,3,P.memory_trace,true)
-    MAT.bloom_ring(CX,CY-10,3,P.memory_trace)
+    -- the rays fan out from Juno — she is the one bringing the memory back
+    draw_juno(CX,CY-10,1,JUNO_TEAL)
+    MAT.bloom_ring(CX,CY-10,15,P.memory_trace)
   end
   if layer_ok(enter_t, A.STAGGER_DETAIL_MS) then
     text(summary,CX,CY+50,P.text_secondary, "lg")
@@ -549,6 +638,12 @@ local function draw_person_context(card, sc, enter_t, exit_t)
     if exit_t == 0 then
       MAT.glass_disc(CX, 96, floor(56*sc), MAT.PANE, 3)
     end
+    -- recognition jewel — concentric memory rings set the face the way
+    -- saved_memory sets a save; knowing someone is a moment worth framing
+    frame.display.circle(CX, 84, floor(60*sc), P.border_subtle, false)
+    frame.display.circle(CX, 84, floor(54*sc), P.accent_memory_dim, false)
+    frame.display.circle(CX, 84, floor(48*sc), P.memory_trace, false)
+    MAT.bloom_ring(CX, 84, floor(60*sc), P.memory_trace)
     frame.display.circle(CX, 84, floor(18*sc), P.border_subtle, false)
     MAT.bloom_ring(CX, 84, floor(18*sc), P.accent_memory_static)
     polar_segs(CX,84, floor(26*sc),floor(44*sc), 12,{0,1,2},P.memory_trace,P.border_subtle,{5,6,7})
@@ -582,10 +677,12 @@ local function draw_privacy_veil(sc, enter_t, exit_t)
   local ring_sc = ease_out_expo(ring_t)
   arc(CX,CY,floor(108*ring_sc*sc), 10,350,P.privacy_danger,48)
   arc(CX,CY,floor(88 *ring_sc*sc),  0,360,P.privacy_danger,32)
-  -- Shield glyph: slams in after rings reach 60%
+  -- Juno goes dark: still with you, wings down, seeing nothing. She
+  -- slams in after the rings reach 60%, in two whole-pixel steps —
+  -- pixels don't tween, and nothing about the veil may feel ambient.
   if enter_t >= 0.6 then
     local glyph_t = clamp((enter_t-0.6)/0.4,0,1)
-    shield_glyph(CX,CY-14,floor(52*ease_out_expo(glyph_t)*sc),P.privacy_danger,true)
+    draw_juno(CX, CY-14, glyph_t < 0.5 and 1 or 2, JUNO_VEIL)
   end
   if layer_ok(enter_t, A.STAGGER_FOOTER_MS) then
     text("PAUSED",CX,CY+32,P.privacy_caution, "lg")
@@ -1113,10 +1210,11 @@ local function draw_juno_reply(card, sc, enter_t, exit_t)
   end
   frame.display.circle(CX, 132, floor(82*sc), P.border_subtle, false)
   if layer_ok(enter_t, A.STAGGER_EYEBROW_MS) then
-    frame.display.circle(CX-40, 64, 3, accent, true)
-    MAT.bloom_ring(CX-40, 64, 3, accent)
+    -- the status dot grew wings: mini Juno signs her own card
+    draw_juno(CX-40, 62, 1, action and JUNO_SUCCESS or JUNO_TEAL)
+    MAT.bloom_ring(CX-40, 62, 15, accent)
     text("JUNO", CX+6, 64, accent, "sm")
-    MAT.grad_line(60, 82, 196, 82, ramp)
+    pinstripe_rule(60, 196, 81)
   end
   if layer_ok(enter_t, A.STAGGER_PRIMARY_MS) then
     if #body <= 20 then
@@ -1136,12 +1234,13 @@ local function draw_answer_ahead(card, sc, enter_t, exit_t)
   end
   frame.display.circle(CX, 128, floor(82*sc), P.border_subtle, false)
   if layer_ok(enter_t, A.STAGGER_EYEBROW_MS) then
-    -- dot sits clear of the 25-char eyebrow (its bloom was grazing the
-    -- first glyph — found in the golden eyeball pass)
-    frame.display.circle(CX-88, 70, 3, P.accent_memory, true)
-    MAT.bloom_ring(CX-88, 70, 3, P.accent_memory)
+    -- mini-Juno sits clear of the 25-char eyebrow, where the dot did
+    -- (the CX-88 nudge from the golden eyeball pass still applies): she
+    -- is the one surfacing the answer, so she signs the card
+    draw_juno(CX-88, 70, 1, JUNO_TEAL)
+    MAT.bloom_ring(CX-88, 70, 15, P.accent_memory)
     text(card.eyebrow or "ON THE TIP OF YOUR TONGUE", CX+4, 70, P.accent_memory, "sm")
-    MAT.grad_line(52, 88, 204, 88, MAT.RAMP_MEMORY)
+    pinstripe_rule(52, 204, 87)
   end
   if layer_ok(enter_t, A.STAGGER_PRIMARY_MS) then
     if #answer <= 22 then

@@ -47,6 +47,15 @@ def main(argv=None) -> int:
     # "localhost by default" was claimed but not true; this makes it true.
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777)
+    # Opt-in https on a sibling port (default: port+1). Phone BROWSERS only
+    # open cameras on a secure context, so the Live Lens needs this to see;
+    # everything else works over plain http exactly as before. The cert is
+    # self-signed, minted once into <dir>/tls/ (needs the `cryptography`
+    # package; absent → a clear message and http-only, never a crash).
+    ap.add_argument("--tls", action="store_true",
+                    help="also serve https for the Live Lens camera")
+    ap.add_argument("--tls-port", type=int, default=0,
+                    help="https port (default: --port + 1)")
     args = ap.parse_args(argv)
 
     # opt-in structured logging (DL_LOG_JSON=1 → one JSON line per record);
@@ -72,9 +81,59 @@ def main(argv=None) -> int:
     brain.start_watching()            # auto-reindex when watched folders change
     brain.start_brief_scheduler()     # deliver the morning brief at brief_hour
     brain.start_calendar_sync()       # pull macOS Calendar.app into the agenda
-    server = make_brain_server(brain, host=args.host, port=args.port)
+
+    # --tls: mint/reuse the appliance cert and start the sibling https
+    # listener the Live Lens camera needs. The http server is told the https
+    # port so the panel's Live Lens link can advertise the secure URL.
+    tls_server = None
+    tls_port = 0
+    if args.tls:
+        from .tls import ensure_self_signed, make_ssl_context
+        pair = ensure_self_signed(args.dir)
+        if pair is None:
+            print("  ⚠ --tls needs the `cryptography` package "
+                  "(pip install 'dreamlayer[verify]') — serving http only.")
+        else:
+            tls_port = args.tls_port or (args.port + 1)
+            try:
+                # Build the SSL context FIRST — a corrupt/mismatched cert or key
+                # raises here. Wrapped so it degrades to http-only rather than
+                # crashing the whole Brain (this runs before serve_forever, so an
+                # uncaught SSLError took camera AND panel AND asks down; refute
+                # 2026-07-18). ensure_self_signed now re-mints a mismatched key,
+                # so this catch is the belt to that suspenders.
+                ctx = make_ssl_context(*pair)
+                tls_server = make_brain_server(brain, host=args.host,
+                                               port=tls_port, tls_port=tls_port)
+                # do_handshake_on_connect=False: DON'T run the TLS handshake in
+                # the single accept-loop thread (where a stalled ClientHello from
+                # an unauthenticated LAN peer would pin ALL new camera connections
+                # with no wall-clock cap; refute 2026-07-18). Deferring it moves
+                # the handshake into the worker thread, under the same per-recv
+                # timeout + header watchdog + bounded semaphore as every request.
+                tls_server.socket = ctx.wrap_socket(
+                    tls_server.socket, server_side=True,
+                    do_handshake_on_connect=False)
+                import threading
+                threading.Thread(target=tls_server.serve_forever,
+                                 daemon=True).start()
+            except Exception as exc:            # noqa: BLE001
+                print(f"  ⚠ --tls setup failed ({exc}) — serving http only.")
+                tls_server, tls_port = None, 0
+
+    # the tls_port kwarg rides only when --tls actually started a listener, so
+    # the bare-launch call shape stays exactly as it always was (pinned by
+    # test_brain_auth_posture's spy).
+    if tls_port:
+        server = make_brain_server(brain, host=args.host, port=args.port,
+                                   tls_port=tls_port)
+    else:
+        server = make_brain_server(brain, host=args.host, port=args.port)
     ip = _lan_ip()
     print(f"DreamLayer Brain — control panel at http://{ip}:{args.port}/")
+    if tls_server is not None:
+        print(f"  Live Lens (camera) — https://{ip}:{tls_port}/dreamlayer/live"
+              "  (panel → Connections → Live Lens for the QR)")
     print(f"  watching {len(brain.config.folders)} folder(s), "
           f"{brain.index.stats()['files']} files indexed")
     if minted_token:
@@ -91,6 +150,9 @@ def main(argv=None) -> int:
         print("\nstopping.")
     finally:
         server.server_close()
+        if tls_server is not None:
+            tls_server.shutdown()
+            tls_server.server_close()
     return 0
 
 

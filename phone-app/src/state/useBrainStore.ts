@@ -45,6 +45,25 @@ export type BrainKind = "phone" | "mac_mini";
 export type MacMini = { connected: boolean; url: string; token: string; relayUrl?: string };
 export type Glasses = { connected: boolean; id: string };
 export type AskResult = { text: string; tier: string; sources: string[] } | null;
+// A World-lens panel: what the glasses would draw when you look at a thing.
+// One row is a fact, an action, or a live stat contributed by a provider.
+export type LookRow = { label: string; detail?: string; value?: string; kind?: string; source?: string };
+export type LookPanel = {
+  ok: boolean;
+  lens?: string;
+  title?: string;
+  subtitle?: string;
+  rows: LookRow[];
+  sources: string[];
+  confidence?: number;
+  reason?: string;     // honest "couldn't see" / "incognito" copy when ok is false
+  veiled?: boolean;
+  // the exact budget-clamped lines the glass would draw (one shared server-side
+  // formatter serves this AND the browser Live Lens — every surface shows the
+  // same look), plus whether the Brain's egress shield kept it local-only.
+  lines?: string[];
+  localOnly?: boolean;
+};
 export type BriefSection = { title: string; items: string[] };
 export type LongBrief = {
   text: string;
@@ -136,6 +155,9 @@ type BrainState = {
   ask: (query: string) => Promise<AskResult>;
   // the deliberate camera tier: a phone photo through the Brain's vision path
   explain: (imageB64: string, label?: string) => Promise<AskResult>;
+  // the World lens: a phone photo → the on-glass panel (Object Lens / TasteLens),
+  // provider rows and all — the phone standing in for the glasses' camera.
+  look: (imageB64: string, opts?: { lens?: string; facet?: string; label?: string; attrs?: Record<string, unknown> }) => Promise<LookPanel>;
 
   // the lens relay — closes the glass→Brain→glass loop for the live showcases:
   //  • feedLens streams host text (a translation, a camera label, a memory)
@@ -485,6 +507,70 @@ export const useBrainStore = create<BrainState>((set, get) => ({
     }
   },
 
+  look: async (imageB64, opts = {}) => {
+    // The World lens run in the Brain — a phone photo through the SAME Object
+    // Lens / TasteLens the glasses will use, so a look comes back as a real
+    // panel (provider rows) instead of only a sentence. POST /brain/look.
+    const empty = (reason: string, veiled = false): LookPanel => ({
+      ok: false, rows: [], sources: [], reason, veiled,
+    });
+    if (get().demoMode) {
+      return {
+        ok: true, lens: "object", title: "Snake plant", subtitle: "Sansevieria",
+        rows: [
+          { label: "seen before", detail: "3× · last at home", kind: "info", source: "memory" },
+          { label: "needs water", kind: "action", source: "plant" },
+        ],
+        sources: ["memory", "plant"], confidence: 0.86,
+        lines: ["Snake plant", "seen before · 3× · home", "needs water", "86% · memory, plant"],
+      };
+    }
+    // The Veil is the wearer's capture switch — a look ships a full photo, so it
+    // must NOT leave the phone past a closed Veil (capture paused / incognito, or
+    // the glasses raised the Veil via PRIVACY_VEIL telemetry). The Brain gates on
+    // its OWN incognito posture, but that's a different signal from the phone /
+    // glasses Veil, so the phone must enforce its own — the "enforce, don't trust
+    // upstream" rule feedLens/emitLens already follow (refute 2026-07-18).
+    if (veilClosed(get().capturePaused)) return empty("The Veil is up — looking is paused.", true);
+    const m = get().macMini;
+    if (!m.connected || !m.url) return empty("Pair your Brain to look through it.");
+    try {
+      const r = await brainFetch(m, "/dreamlayer/brain/look", {
+        method: "POST",
+        body: JSON.stringify({
+          image: imageB64, lens: opts.lens ?? "object", facet: opts.facet,
+          label: opts.label, attrs: opts.attrs, no_cloud: !get().effectiveCloud(),
+        }),
+      });
+      const j = await r.json();
+      if (!j?.ok) return empty(j?.reason ?? "Couldn't make it out.", !!j?.veiled);
+      const p = j.panel ?? j.card ?? {};
+      const lines: string[] = Array.isArray(j.lines)
+        ? j.lines.filter((ln: unknown): ln is string => typeof ln === "string")
+        : [];
+      // Defend the row ELEMENTS, not just the array shape: a malformed Brain
+      // response {rows:[null]} would otherwise crash the panel render on r.label
+      // (refute 2026-07-18). Keep only real objects.
+      const rows: LookRow[] = Array.isArray(p.rows)
+        ? p.rows.filter((r: unknown): r is LookRow => !!r && typeof r === "object")
+        : [];
+      return {
+        ok: true, lens: j.lens ?? "object",
+        title: p.primary ?? p.title ?? "",
+        subtitle: p.detail ?? p.subtitle ?? "",
+        rows,
+        sources: Array.isArray(j.sources) && j.sources.length
+          ? j.sources
+          : (Array.isArray(p.sources) ? p.sources : (p.footer ? [String(p.footer)] : [])),
+        confidence: typeof p.confidence === "number" ? p.confidence : undefined,
+        lines,
+        localOnly: j.local_only === true,
+      };
+    } catch {
+      return empty("Couldn't reach your Brain — try again when it's back.");
+    }
+  },
+
   // -- the lens relay: close the loop on the phone side ----------------------
   feedLens: async (text, source = "") => {
     if (get().demoMode) return true;                 // the builder sim already shows it
@@ -507,9 +593,11 @@ export const useBrainStore = create<BrainState>((set, get) => ({
 
   emitLens: async (tag, text = "") => {
     if (get().demoMode) return { text: "", tier: "device", sources: [] };
-    // only "ask" carries captured speech; refuse it while the Veil is closed.
-    // Other tags are inert lens control signals with no captured payload.
-    if (tag === "ask" && veilClosed(get().capturePaused)) return null;
+    // "ask" carries captured speech; refuse it while the Veil is closed. Key the
+    // gate on the PAYLOAD, not just the tag string — a future caller that attaches
+    // text to some other tag must not be able to stream captured content past a
+    // closed Veil either (refute 2026-07-18: the tag-only gate was latent-unsafe).
+    if (veilClosed(get().capturePaused) && (tag === "ask" || !!text)) return null;
     const m = get().macMini;
     if (!m.connected || !m.url || !tag) return null;
     try {

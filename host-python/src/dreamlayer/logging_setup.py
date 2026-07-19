@@ -93,10 +93,23 @@ _RESERVED = {
 _SENSITIVE_KEYS = {
     "name", "names", "summary", "transcript", "transcripts",
     "embedding", "embeddings", "contact", "contacts", "query", "answer",
+    # ``reply`` is a Juno/API-brain answer — attacker-influenceable free text
+    # (extra={"reply": juno_text}). Added as a KEY, not a substring root, so it
+    # redacts ``reply``/``user_reply`` (exact + ``_reply`` suffix) without a
+    # loose "reply" substring catching unrelated words. ``reply_text`` already
+    # falls under the ``text`` rule; ``reply_content`` under ``content``.
+    "reply",
     "token", "api_key", "apikey", "key", "secret", "secrets", "password",
     "passphrase", "text", "caption", "captions", "email", "phone",
     "address", "prompt", "content", "message_body", "credential",
     "credentials", "auth", "authorization", "session", "cookie",
+    # ``cue`` is a memory cue — the ember/tending pipeline builds it from a
+    # memory's own summary, so it carries a person's name or the summary's lead
+    # words verbatim (the SAME content that rides as the sensitive ``summary``
+    # key). A KEY, not a substring root, so ``cue``/``memory_cue`` (exact +
+    # ``_cue`` suffix) redact without a loose "cue" catching ``rescue`` (refute
+    # 2026-07-18: a burn log interpolated ``cue`` and the taxonomy was blind to it).
+    "cue", "cues",
 }
 
 
@@ -136,7 +149,14 @@ def _sanitize(val: object, depth: int = 0) -> object:
                          else _sanitize(v, depth + 1)) for k, v in val.items()}
     if isinstance(val, (list, tuple)):
         return [_sanitize(v, depth + 1) for v in val]
-    return val
+    if isinstance(val, (str, int, float, bool)) or val is None:
+        return val
+    # An opaque value (a pydantic model / dataclass / arbitrary object) is not
+    # JSON-serialisable, and its repr can carry PII the key-based redaction can't
+    # reach inside (extra={"result": <obj with .name/.transcript>}). Emit a
+    # type-only marker — NEVER the raw repr — so a caller can't bypass redaction
+    # by handing the logger an unserialisable value (refute 2026-07-17).
+    return f"<unserialised:{type(val).__name__}>"
 
 
 def _redact(val: object) -> str:
@@ -156,13 +176,29 @@ class JsonLineFormatter(logging.Formatter):
     """One compact JSON object per record; extras (logger.info(msg, extra={…}))
     ride alongside the standard fields. Values under known-sensitive keys are
     redacted (replaced with a ``<redacted:hash>`` marker) before serialisation
-    so PII/secrets never reach the log line."""
+    so PII/secrets never reach the log line.
+
+    Contract: the ``extra={...}`` path is the ONLY redaction seam. The rendered
+    message (``record.getMessage()``) is emitted verbatim, so callers MUST NOT
+    interpolate sensitive values (names, transcripts, replies, tokens) into the
+    message string — pass them via ``extra=`` instead. This is now CI-enforced:
+    ``tests/test_logging_discipline.py`` AST-scans the shipped source and fails
+    the build if any logging call interpolates a value whose identifier matches
+    one of the sensitive roots below, so the discipline can't silently rot."""
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": round(record.created, 3),
             "level": record.levelname,
             "logger": record.name,
+            # msg is the rendered message body and is emitted VERBATIM — it is
+            # deliberately NOT redacted (redacting arbitrary text would mangle
+            # legit logs). The extras path (``extra={...}``) is the redaction
+            # seam: callers MUST pass sensitive values (names, transcripts,
+            # replies, tokens) via ``extra=`` — never interpolate them into the
+            # message string — so ``_is_sensitive``/``_sanitize`` can scrub them.
+            # This "no PII in the message" rule is CI-enforced by
+            # tests/test_logging_discipline.py (AST scan of every call site).
             "msg": record.getMessage(),
         }
         cid = _CID.get()
@@ -175,11 +211,21 @@ class JsonLineFormatter(logging.Formatter):
                 if _is_sensitive(key):
                     payload[key] = _redact(val)
                     continue
+                # Redact FIRST, THEN serialise the SANITISED structure. _sanitize
+                # walks nested dicts/lists redacting sensitive keys (extra=
+                # {"result": {"name": …, "transcript": …}}) and replaces opaque
+                # objects with a type marker, so its output is always JSON-safe.
+                # The old code tested json.dumps on the RAW value and fell through
+                # to repr(val) when it failed — skipping redaction entirely, so
+                # any non-serialisable value (a model, or a dict with ONE non-
+                # serialisable leaf) leaked verbatim past the scrub (refute
+                # 2026-07-17; the _sanitize wiring itself was the 2026-07-15 fix).
+                safe = _sanitize(val)
                 try:
-                    json.dumps(val)          # only serialisable extras
-                    payload[key] = val
+                    json.dumps(safe)
+                    payload[key] = safe
                 except (TypeError, ValueError):
-                    payload[key] = repr(val)
+                    payload[key] = repr(safe)
         return json.dumps(payload, separators=(",", ":"))
 
 

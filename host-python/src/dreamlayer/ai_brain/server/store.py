@@ -6,9 +6,12 @@ inspect, back up, or hand-edit.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -17,6 +20,15 @@ from typing import Optional
 CONFIG_FILE = "brain_config.json"
 HISTORY_FILE = "brain_history.jsonl"
 ACTIVITY_FILE = "brain_activity.jsonl"
+
+# A crashed save between mkstemp and the atomic replace can leave a
+# uniquely-named "<config>.<rand>.tmp" orphan (the per-writer temp no longer
+# self-limits to one fixed name the way "<config>.tmp" did). save() sweeps such
+# orphans, but only ones older than this grace window, so a CONCURRENT saver's
+# in-flight temp is never yanked out from under its own replace.
+_TMP_REAP_GRACE = 60.0
+
+log = logging.getLogger("dreamlayer.ai_brain.server.store")
 
 
 def replace_atomic(src, dst, timeout: float = 10.0, burst: int = 50) -> None:
@@ -52,6 +64,206 @@ def replace_atomic(src, dst, timeout: float = 10.0, burst: int = 50) -> None:
         delay = min(delay * 2, 0.05)
 
 
+def _reap_stale_tmps(d: Path) -> None:
+    """Best-effort sweep of orphaned '<config>.*.tmp' temps in `d`.
+
+    save() writes to a per-writer unique tempfile.mkstemp temp, then atomically
+    replaces the target with it. A hard crash BETWEEN mkstemp and replace leaves
+    that uniquely-named temp behind and — unlike the old fixed '<config>.tmp'
+    name, which the next save reused/overwrote — a unique name is never touched
+    again, so orphans would accumulate forever (refute 2026-07-17). Only temps
+    older than _TMP_REAP_GRACE are removed, so a concurrent saver's just-created
+    temp is left alone (its own replace still needs it). All errors are
+    swallowed: reaping is hygiene, never a reason to fail a save."""
+    cutoff = time.time() - _TMP_REAP_GRACE
+    try:
+        candidates = list(d.glob(CONFIG_FILE + ".*.tmp"))
+    except OSError:
+        return
+    for f in candidates:
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _current_user_sid() -> Optional[str]:
+    """The calling process's user SID as a string ("S-1-5-...") on Windows.
+
+    Read straight off the process token (OpenProcessToken + GetTokenInformation
+    for TokenUser), so it's locale- and domain-independent — unlike a username,
+    which icacls would have to resolve through whatever the box's naming context
+    is. Returns None on any failure; the caller falls back to the account name.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TOKEN_QUERY = 0x0008
+    TokenUser = 1
+    # WinDLL exists only on Windows; this fn is only reached on nt (guarded by
+    # _harden_windows_acl), but mypy checks it on every platform.
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+
+    # Declare argtypes/restypes explicitly. ctypes otherwise assumes every arg
+    # and return is a C int, which on Win64 truncates 64-bit HANDLEs and SID
+    # pointers to 32 bits — the old code only "worked" by luck of handle
+    # sign-extension. Pinning the signatures makes the marshalling correct.
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        return None
+    try:
+        size = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, TokenUser, None, 0, ctypes.byref(size))
+        if not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(
+                token, TokenUser, buf, size, ctypes.byref(size)):
+            return None
+        # TOKEN_USER begins with SID_AND_ATTRIBUTES { PSID Sid; ... }; the SID
+        # pointer is the first machine-word of the buffer.
+        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+        str_sid = ctypes.c_wchar_p()
+        if not advapi32.ConvertSidToStringSidW(
+                ctypes.c_void_p(psid), ctypes.byref(str_sid)):
+            return None
+        try:
+            return str_sid.value
+        finally:
+            kernel32.LocalFree(str_sid)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _harden_windows_acl(path: str) -> None:
+    """Windows only: restrict `path` to the current user + LocalSystem + the
+    Administrators group, so no *other regular user* can read it.
+
+    POSIX chmod(0o600) is a no-op for ACLs on Windows — it toggles just the
+    read-only attribute and sets NO ACL, so a secret config's confidentiality
+    would rest entirely on whatever ACLs it inherited from the user profile.
+    This strips inheritance and re-grants Full control to exactly three
+    principals:
+
+      * ``S-1-5-18``     LocalSystem     — AV, backup, and OS agents run here;
+      * ``S-1-5-32-544`` Administrators  — admin tooling / the elevated installer;
+      * the current user's SID           — the app itself.
+
+    Stripping inheritance also drops the inherited SYSTEM/Administrators ACEs,
+    so they MUST be re-granted or a plain ``/grant:r *<userSID>:F`` would lock
+    out AV/backup/OS-agent readers (and, if the user grant itself failed, the
+    app). Confidentiality vs other regular users is still preserved — Users and
+    Everyone are gone — while SYSTEM/Administrators (which can read anything on
+    the box anyway) keep access. Both well-known SIDs are locale- and
+    domain-independent, so this holds regardless of language pack or domain.
+
+    The grantee is the process-token SID, never a bare account name: on a
+    domain-joined box a bare ``getpass.getuser()`` name can fail to map once
+    inheritance is stripped, leaving the file unreadable by the app — the
+    lockout path. So if the SID can't be resolved we do NOT strip inheritance
+    behind a possibly-unmappable grant; we skip the whole ACL step and leave the
+    file at its inherited-profile baseline (already not world-readable), logging
+    a warning. Never leave the file in a state the app can't read.
+
+    Best-effort by contract: any failure is logged and swallowed — the
+    POSIX-correct 0o600 already ran, and persisting the privacy posture must
+    never crash on ACL plumbing. A hard no-op on non-Windows, so the POSIX save
+    path is not touched (returns before importing anything).
+    """
+    if os.name != "nt":
+        return
+    import subprocess
+
+    try:
+        sid = _current_user_sid()
+    except Exception as exc:             # ctypes/token lookup is fragile; degrade
+        log.warning("owner-only ACL: SID lookup failed for %s (%s); leaving the "
+                    "inherited ACL baseline (the state dir is hardened too)",
+                    path, exc)
+        return
+    argv = _owner_only_icacls_argv(path, sid)
+    if argv is None:
+        log.warning("owner-only ACL: could not resolve the current-user SID for "
+                    "%s; leaving the inherited ACL baseline (the state dir is "
+                    "hardened too)", path)
+        return
+    try:
+        subprocess.run(
+            argv, check=True, capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        log.warning("owner-only ACL hardening failed for %s: %s", path, exc)
+
+
+def _owner_only_icacls_argv(path: str, user_sid: Optional[str]) -> Optional[list]:
+    """The icacls invocation that strips inheritance and grants Full control to
+    exactly current-user + LocalSystem + Administrators — the owner-only DACL.
+
+    Returns None when the user SID is missing/empty: the caller MUST then skip
+    hardening (leaving the file at its — now dir-hardened — inherited baseline)
+    and never fall back to a broad grant. LocalSystem (S-1-5-18) and
+    Administrators (S-1-5-32-544) are locale/domain-independent well-known SIDs,
+    kept alongside the user so stripping inheritance doesn't evict OS/AV/backup
+    readers (or the app). icacls accepts ``*<SID>`` for a grantee, so the grant
+    stays locale/domain-independent even after the resolved-name ACEs are
+    dropped. Extracted as a pure builder so a cross-platform test can pin the
+    exact grant shape (inheritance stripped, no broad principal, fail-closed on a
+    missing SID) without a Windows box."""
+    if not user_sid:
+        return None
+    return ["icacls", path, "/inheritance:r", "/grant:r",
+            "*S-1-5-18:F",        # LocalSystem
+            "*S-1-5-32-544:F",    # Administrators
+            "*" + user_sid + ":F"]
+
+
+def _harden_state_dir(d) -> None:
+    """Make the Brain's state DIRECTORY owner-only, so every file created inside
+    it — brain_config.json and its mkstemp temp, plus the history/activity logs —
+    is born private BY INHERITANCE.
+
+    The per-file _harden_windows_acl runs only AFTER the config is written and
+    atomically swapped in, and it is SKIPPED entirely when the current-user SID
+    can't be resolved. That left two gaps a refute pass found (2026-07-18): (1) a
+    per-save window where the mkstemp temp / post-replace target carry only the
+    directory-INHERITED ACL until icacls runs, and (2) on SID-lookup failure the
+    file is left at that inherited baseline forever. Both are safe ONLY if the
+    directory itself is owner-only — which, under a broad $DREAMLAYER_DIR (e.g.
+    C:\\ProgramData\\Dreamlayer, whose default ACL grants BUILTIN\\Users read),
+    it is NOT unless hardened here. icacls applies (OI)(CI) inheritance by
+    default, so children inherit the owner-only grant; POSIX chmod 0o700 does the
+    same. The docstring's old promise that the inherited baseline is "already not
+    world-readable" is only TRUE once this runs. Best-effort, like the file
+    harden — never crash a save on ACL plumbing."""
+    try:
+        os.chmod(d, 0o700)          # POSIX owner-only dir; inert (read-only bit) on NTFS
+    except OSError:
+        pass
+    # Windows dir ACL: (OI)(CI) so children inherit owner-only; a no-op on POSIX.
+    _harden_windows_acl(str(d))
+
+
 def _is_allowed_root(path: str) -> bool:
     """True if `path` may be indexed by the Brain.
 
@@ -74,6 +286,59 @@ def _is_allowed_root(path: str) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     for root in allowed_roots:
+        if p == root or root in p.parents:
+            return True
+    return False
+
+
+# Dot-directories whose contents are secrets-at-rest by convention. ~/.config is
+# deliberately excluded — too broad, it holds ordinary app state — so this stays
+# to the clearly-secret ones (private keys, cloud creds, GPG keyrings).
+_SECRET_DOTDIRS = (".ssh", ".aws", ".gnupg")
+
+
+def _state_dir() -> Optional[Path]:
+    """The Brain's OWN state directory, resolved exactly the way every entry
+    point resolves it ($DREAMLAYER_DIR, else ~/.dreamlayer). It holds
+    brain_config.json — the pairing token + cloud_api_key + api_key in CLEAR —
+    plus the query/activity logs. None if it can't be resolved."""
+    base = os.environ.get("DREAMLAYER_DIR") or str(Path.home() / ".dreamlayer")
+    try:
+        return Path(base).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _is_index_denied(path: str) -> bool:
+    """True if `path` must be kept OUT of the Brain's index even when it passes
+    the _is_allowed_root allow-list (i.e. resolves under the user's home tree).
+
+    The allow-list permits anything under home, but the Brain's OWN state dir
+    lives there too — and its brain_config.json holds the pairing token and both
+    provider API keys in clear, while brain_history/activity hold past queries. A
+    '.json' target matches index.TEXT_EXTS, so without this denylist a symlink
+    inside a watched folder pointing at <statedir>/brain_config.json — or simply
+    adding <statedir> as a watched folder — would ingest those secrets and make
+    them RECALLABLE via /brain/ask, undercutting the 0o600/ACL secret-at-rest
+    work (refute-remediation 2026-07-17). Common secret-at-rest dotdirs (~/.ssh,
+    ~/.aws, ~/.gnupg) are refused for the same reason. The path is fully resolved
+    first so `..`/symlink escapes can't smuggle a denied target past the check;
+    an unresolvable path is refused (default-deny). This is index-only, distinct
+    from _is_allowed_root, so the Windows calendar reader can still load its
+    <statedir>/calendars/*.ics feeds (which never reach the index)."""
+    try:
+        p = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return True
+    sd = _state_dir()
+    if sd is not None and (p == sd or sd in p.parents):
+        return True
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for name in _SECRET_DOTDIRS:
+        root = home / name
         if p == root or root in p.parents:
             return True
     return False
@@ -216,21 +481,91 @@ class BrainConfig:
     @classmethod
     def load(cls, cfg_dir: Path | str) -> "BrainConfig":
         p = Path(cfg_dir) / CONFIG_FILE
-        if p.exists():
-            try:
-                data = json.loads(p.read_text())
-                known = {f.name for f in field_list(cls)}
-                inst = cls(**{k: v for k, v in data.items() if k in known})
-                inst.sanitize_folders()   # a tampered/legacy file can't smuggle disallowed roots
-                return inst
-            except (ValueError, TypeError, json.JSONDecodeError):
-                pass
-        return cls()
+        try:
+            raw = p.read_text()
+        except FileNotFoundError:
+            return cls()                  # no config yet — first run
+        except OSError as exc:
+            # PermissionError etc.: a config the new owner-only ACL (Windows) or
+            # a bad mode made unreadable to THIS process would otherwise crash
+            # load — dropping the wearer out of Incognito and losing their
+            # watched folders. A missing-OR-unreadable config falls back to
+            # defaults, never raises (refute-remediation 2026-07-17). ``exists()``
+            # was dropped here: it re-raises PermissionError on an unreadable path
+            # exactly like read_text, so guarding read_text alone still crashed.
+            log.warning("brain_config load: %s unreadable (%s); using defaults",
+                        p, exc)
+            return cls()
+        try:
+            data = json.loads(raw)
+            known = {f.name for f in field_list(cls)}
+            inst = cls(**{k: v for k, v in data.items() if k in known})
+            inst.sanitize_folders()   # a tampered/legacy file can't smuggle disallowed roots
+            return inst
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return cls()
 
     def save(self, cfg_dir: Path | str) -> None:
+        # tmp + atomic replace: a plain write_text can be caught torn by a crash
+        # or AV lock mid-write, and BrainConfig.load() turns a JSONDecodeError
+        # into cls() DEFAULTS — silently dropping the wearer out of Incognito
+        # (network_mode → "connected") and losing their watched folders. The
+        # config store holds the privacy posture, so it must never half-write
+        # (audit 2026-07-15). replace_atomic also rides out Windows share-mode
+        # contention, matching the JSON stores.
         d = Path(cfg_dir)
         d.mkdir(parents=True, exist_ok=True)
-        (d / CONFIG_FILE).write_text(json.dumps(asdict(self), indent=2))
+        # Harden the DIRECTORY first, so the mkstemp temp and the swapped-in
+        # target are born owner-only by inheritance — closing the pre-icacls
+        # write window and the fail-to-inherited gap when the per-file SID lookup
+        # is skipped (refute 2026-07-18). Must precede _reap_stale_tmps/mkstemp.
+        _harden_state_dir(d)
+        _reap_stale_tmps(d)   # sweep crash-orphaned unique temps (age-gated)
+        target = d / CONFIG_FILE
+        # This file holds the pairing token AND the provider API keys
+        # (cloud_api_key/api_key) in clear, so it must never be group/world
+        # readable. write_text lands at the umask default (0o644 on POSIX),
+        # which the login-entry fix (token moved off the HKCU Run value / the
+        # LaunchAgent plist into this file) turned into a fresh world-readable
+        # secret leak.
+        #
+        # The temp is a per-writer UNIQUE file from tempfile.mkstemp: it opens
+        # O_EXCL at mode 0o600, so it is private from its first byte AND no two
+        # savers can collide on it. The old fixed "<config>.tmp" opened without
+        # O_EXCL was reopen-and-truncate: a stale 0o644 tmp left by a crash or an
+        # older build would be reused KEEPING its world-readable mode, leaking
+        # the secrets through the temp (refute 2026-07-17). 0o600 is re-asserted
+        # on the swapped-in target, and _harden_windows_acl adds the owner-only
+        # ACL that chmod cannot express on Windows (no-op elsewhere).
+        payload = json.dumps(asdict(self), indent=2)
+        fd, tmp = tempfile.mkstemp(dir=str(d), prefix=CONFIG_FILE + ".",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(payload)
+            replace_atomic(tmp, str(target))
+        except Exception:
+            try:
+                os.unlink(tmp)             # no torn/readable residue if it fails
+            except OSError:
+                pass
+            raise
+        try:
+            os.chmod(target, 0o600)         # re-assert after the atomic swap
+        except OSError:
+            pass
+        # Windows ACL; no-op on POSIX. Re-applied on EVERY save, unconditionally:
+        # save() writes a fresh tempfile.mkstemp temp and os.replace()s it onto
+        # target (MoveFileExW on Windows), which makes the temp BECOME the target
+        # — and that temp carries only the directory-INHERITED ACL, not the
+        # explicit owner-only DACL. So os.replace/MoveFileEx DISCARDS the
+        # destination DACL every save; the owner-only ACL must be re-applied each
+        # time or the very next save (e.g. pairing writing the token) leaves the
+        # config at its inherited-profile baseline. Config saves are infrequent
+        # (pairing, folder add/remove, incognito toggle, config patches), not a
+        # hot path, so the per-save icacls + token lookup is acceptable
+        # (refute 2026-07-17: a create-only gate silently un-hardened the file).
+        _harden_windows_acl(str(target))
 
     def public(self) -> dict:
         """Config for the panel — never leaks the token or any provider key."""
@@ -287,40 +622,330 @@ class QueryHistory:
         _restore_jsonl(self.path, items)
 
 
+def _receipt_core(rec: dict) -> dict:
+    """The signed core of an activity record — the fields a receipt attests."""
+    return {"seq": rec["seq"], "ts": rec["ts"], "kind": rec["kind"],
+            "text": rec["text"], "prev": rec["prev"]}
+
+
+def _receipt_hash(core: dict) -> str:
+    """sha256 of a record's canonical core — the chain link the next record binds."""
+    data = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
 class ActivityLog:
     """Everything the Brain did — folders, files, searches, cloud/incognito
-    toggles, pairing — as a single newest-first feed for the panel."""
+    toggles, pairing — as a single newest-first feed for the panel.
 
-    def __init__(self, cfg_dir: Path | str):
+    On a camera-and-mic device the ledger IS the privacy promise, so it is
+    tamper-evident: when a `signer` (Ed25519) is supplied, each record carries a
+    monotonic `seq`, the `prev` sha256 of the previous record's core (a hash
+    chain), and a `sig` over that core. A third party handed only the PUBLIC key
+    can then `verify()` that no record was modified, reordered, or dropped from
+    the middle by anyone without the private key — "trust us we were incognito"
+    becomes a checkable receipt (`/dreamlayer/receipt`). The signer is optional
+    and additive: with none, or on an existing unsigned log, it behaves exactly
+    as before and `recent()` is unchanged (refute 2026-07-18: the ledger was a
+    freely-rewritable text file with clear()/prune()/restore() and no signature).
+    """
+
+    def __init__(self, cfg_dir: Path | str, signer=None):
         self.path = Path(cfg_dir) / ACTIVITY_FILE
+        self._head_path = self.path.with_name(self.path.name + ".head")
+        self._signer = signer
+        self._head_hash = ""            # sha256 of the last record's core ("" = genesis)
+        self._next_seq = 0
+        self._loaded = False
+        # The threaded Brain server calls add() from multiple request threads;
+        # the signed chain has shared mutable state (_head_hash/_next_seq) and
+        # writes a head anchor, so a bare append would race two records onto the
+        # same seq and collide the anchor temp-file. Serialize the mutators.
+        # Re-entrant so prune/restore can call _rechain while holding it.
+        self._lock = threading.RLock()
+
+    # -- the signed head anchor (defeats tail truncation) ---------------------
+    # A hash chain alone protects edits/reorders/mid-deletions, but NOTHING
+    # anchors its LENGTH: a valid prefix of a valid chain is itself a valid chain,
+    # so an attacker can chop the most-recent (incriminating) records and verify()
+    # would still pass (refute 2026-07-18). This separate, key-SIGNED checkpoint
+    # attests the current high-water mark {last_seq, head, count}; verify() checks
+    # the file's tail against it, so a truncation an attacker can't re-sign is
+    # caught. The owner (with the key) re-signs it on every add/prune/restore.
+    def _write_head(self) -> None:
+        if self._signer is None:
+            return
+        core = {"last_seq": self._next_seq - 1, "head": self._head_hash,
+                "count": self._next_seq}
+        doc = {**core, "sig": self._signer.sign(core)}
+        self._head_path.parent.mkdir(parents=True, exist_ok=True)
+        # a UNIQUE temp per write: a fixed ".head.tmp" collided when two threads
+        # wrote concurrently (one's os.replace moved it out from under the other).
+        fd, tmp = tempfile.mkstemp(dir=str(self._head_path.parent),
+                                   prefix=self._head_path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(doc))
+            os.replace(tmp, self._head_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _read_head(self) -> Optional[dict]:
+        """The verified head anchor, or None (absent / unverifiable / no signer)."""
+        if self._signer is None or not self._head_path.exists():
+            return None
+        try:
+            doc = json.loads(self._head_path.read_text())
+            core = {"last_seq": doc["last_seq"], "head": doc["head"],
+                    "count": doc["count"]}
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if not self._signer.verify(core, doc.get("sig", "")):
+            return None                        # a forged/edited anchor is no anchor
+        return core
+
+    def _signed_head(self) -> Optional[dict]:
+        """The head anchor WITH its signature, so a third party (the panel, the
+        phone) can verify the length attestation itself instead of trusting our
+        server-side check. Returns {last_seq, head, count, sig} or None. The core
+        the sig covers is {last_seq, head, count} — canonicalized the same way as
+        a record core (sorted keys, compact separators)."""
+        core = self._read_head()
+        if core is None:
+            return None
+        try:
+            sig = json.loads(self._head_path.read_text()).get("sig", "")
+        except (OSError, json.JSONDecodeError):
+            return None
+        return {**core, "sig": sig}
+
+    # -- the chain head (lazy: from the SIGNED anchor, not attacker file state) --
+    def _load_head(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        head = self._read_head()
+        if head is not None:
+            # trust the signed checkpoint, so a record an attacker APPENDED (with a
+            # bogus seq/prev to poison the next add) cannot redirect our chain.
+            self._next_seq = head["last_seq"] + 1
+            self._head_hash = head["head"]
+            return
+        recs = self._read_all()                # legacy / no anchor yet
+        for rec in recs:
+            if "seq" in rec and "prev" in rec:
+                self._next_seq = rec["seq"] + 1
+                try:
+                    self._head_hash = _receipt_hash(_receipt_core(rec))
+                except (KeyError, TypeError):
+                    self._head_hash = ""
 
     def add(self, kind: str, text: str, ts: Optional[float] = None) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        rec = {"ts": ts if ts is not None else time.time(),
-               "kind": kind, "text": text}
-        with self.path.open("a") as f:
-            f.write(json.dumps(rec) + "\n")
+        # ALWAYS store ts as a float. Python's json.dumps renders a float as
+        # "N.0" but an int as "N"; the signed core and every client canonicalizer
+        # assume a float, so an int ts would make a legitimate receipt fail
+        # client verification. Coercing here keeps the wire form unambiguous.
+        ts = float(ts) if ts is not None else time.time()
+        rec: dict = {"ts": ts, "kind": kind, "text": text}
+        # The signed-chain critical section (seq/head advance + anchor write) must
+        # be atomic across the threaded server, or two adds collide on a seq and
+        # corrupt the chain. The unsigned path holds the lock too (cheap) so a
+        # concurrent append can't interleave a half-written line.
+        with self._lock:
+            if self._signer is not None:
+                self._load_head()
+                rec["seq"] = self._next_seq
+                rec["prev"] = self._head_hash
+                core = _receipt_core(rec)
+                rec["sig"] = self._signer.sign(core)
+                self._head_hash = _receipt_hash(core)
+                self._next_seq += 1
+            with self.path.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+            self._write_head()                 # advance the signed high-water mark
 
-    def recent(self, n: int = 40) -> list[dict]:
+    def _read_all(self) -> list[dict]:
+        """All records, oldest-first (file order)."""
         if not self.path.exists():
             return []
         out = []
-        for line in self.path.read_text().splitlines()[-n:]:
+        for line in self.path.read_text().splitlines():
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        return list(reversed(out))
+        return out
+
+    def recent(self, n: int = 40) -> list[dict]:
+        return list(reversed(self._read_all()[-n:]))
+
+    # -- verification ---------------------------------------------------------
+    def verify(self) -> dict:
+        """Walk the chain and report integrity. ``ok`` is True when every SIGNED
+        record verifies against the public key AND its prev-link is intact.
+        Unsigned/legacy records are reported (``unsigned``), never flagged as
+        tampered. Fail-safe: with no signer or no cryptography, ``ok`` is False
+        and ``reason`` explains why it is unverifiable, never a misleading True."""
+        recs = self._read_all()
+        signer = self._signer
+        pub = getattr(signer, "public_key_hex", "") if signer else ""
+        if signer is None or not getattr(signer, "available", False) or not pub:
+            return {"ok": False, "records": len(recs), "signed": 0, "unsigned": len(recs),
+                    "first_broken": None, "pubkey": pub,
+                    "reason": "no Ed25519 receipt key (install the 'privacy' extra)"}
+        expected_prev: Optional[str] = ""
+        signed = unsigned = 0
+        first_broken = None
+        last_seq_seen = -1
+        running_head = ""
+        for i, rec in enumerate(recs):
+            if "sig" not in rec or "seq" not in rec or "prev" not in rec:
+                unsigned += 1
+                expected_prev = None           # chain continuity is unknown past a gap
+                continue
+            try:
+                core = _receipt_core(rec)
+            except KeyError:
+                first_broken = first_broken if first_broken is not None else i
+                continue
+            link_ok = expected_prev is None or rec["prev"] == expected_prev
+            sig_ok = signer.verify(core, rec["sig"])
+            if not (link_ok and sig_ok):
+                first_broken = first_broken if first_broken is not None else rec.get("seq", i)
+            else:
+                signed += 1
+                last_seq_seen = rec["seq"]
+            expected_prev = _receipt_hash(core)
+            running_head = expected_prev
+        ok = first_broken is None and unsigned == 0 and signed == len(recs)
+        out = {"ok": ok, "records": len(recs), "signed": signed, "unsigned": unsigned,
+               "first_broken": first_broken, "pubkey": pub}
+        # Tail-truncation check against the signed head anchor. An attacker who
+        # chops recent records can't re-sign the checkpoint, so a stale
+        # last_seq/count/head betrays the cut.
+        head = self._read_head()
+        if head is not None:
+            if head["last_seq"] > last_seq_seen or head["count"] > signed \
+                    or (ok and running_head != head["head"]):
+                out["ok"] = False
+                out["truncated"] = True
+                if out["first_broken"] is None:
+                    out["first_broken"] = last_seq_seen + 1     # first missing seq
+                out["reason"] = (f"tail truncated: anchor attests {head['count']} "
+                                 f"records up to seq {head['last_seq']}, file has "
+                                 f"{signed} up to seq {last_seq_seen}")
+        elif signed > 0:
+            # a signed log with NO valid anchor: the anchor was deleted (or a
+            # pre-anchor legacy log). Fail-safe — report it rather than pass.
+            out["ok"] = False
+            out["reason"] = "signed log has no valid head anchor (deleted or legacy)"
+        return out
+
+    def receipt(self, n: int = 2000) -> dict:
+        """A portable, third-party-verifiable proof of what the Brain did: the
+        records (with their seq/prev/sig), the public key to check them against,
+        and this Brain's own verify() result."""
+        recs = self._read_all()[-n:]
+        return {"pubkey": getattr(self._signer, "public_key_hex", "") if self._signer else "",
+                "algorithm": "ed25519-sha256-chain",
+                "records": recs,
+                # the signed high-water mark, so a third party given only the last
+                # `n` records can still detect a truncated tail (records may start
+                # mid-chain, but head.last_seq/count attest the true length). Carries
+                # its OWN signature so the client verifies the anchor itself.
+                "head": self._signed_head(),
+                "verification": self.verify()}
+
+    # -- owner edits: re-chain the survivors so the receipt stays consistent ---
+    def _rechain(self, recs: list[dict]) -> None:
+        """Rewrite the log, re-numbering + re-signing `recs` from a fresh genesis.
+        A legitimate owner edit (prune/restore) with the key in hand re-attests
+        the surviving records; an attacker WITHOUT the key cannot, so their edit
+        fails verify()."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        prev, seq = "", 0
+        with self.path.open("w") as f:
+            for src in recs:
+                rec = {"ts": float(src.get("ts", time.time())),  # float — see add()
+                       "kind": src.get("kind", ""), "text": src.get("text", "")}
+                if self._signer is not None:
+                    rec["seq"] = seq
+                    rec["prev"] = prev
+                    core = _receipt_core(rec)
+                    rec["sig"] = self._signer.sign(core)
+                    prev = _receipt_hash(core)
+                    seq += 1
+                f.write(json.dumps(rec) + "\n")
+        self._head_hash, self._next_seq, self._loaded = prev, seq, True
+        self._write_head()                     # re-attest the new (owner-signed) head
 
     def clear(self) -> None:
-        if self.path.exists():
-            self.path.unlink()
+        with self._lock:
+            if self.path.exists():
+                self.path.unlink()
+            if self._head_path.exists():
+                self._head_path.unlink()       # drop the anchor with the log
+            self._head_hash, self._next_seq, self._loaded = "", 0, True
 
     def prune(self, days: int) -> int:
-        return _prune_jsonl(self.path, days)
+        if self._signer is None:
+            return _prune_jsonl(self.path, days)
+        with self._lock:
+            if days <= 0 or not self.path.exists():
+                return 0
+            cutoff = time.time() - days * 86400
+            recs = self._read_all()
+            kept = [r for r in recs if r.get("ts", 0) >= cutoff]
+            removed = len(recs) - len(kept)
+            if removed:
+                self._rechain(kept)
+            return removed
 
     def restore(self, items) -> None:
-        _restore_jsonl(self.path, items)
+        if self._signer is None:
+            _restore_jsonl(self.path, items)
+            return
+        with self._lock:
+            # `items` arrives newest-first (as recent()/state export produce it).
+            self._rechain(list(reversed(list(items or []))))
+
+
+def activity_receipt_signer(cfg_dir: Path | str):
+    """Load-or-create the persistent Ed25519 seed that signs the activity receipt.
+
+    The seed is the root of trust for the tamper-evident privacy ledger, so it is
+    held by the secret_store (OS keychain / enclave when available, an owner-only
+    file otherwise) rather than as a bare plaintext file. The file backend uses
+    the same ``receipt.key`` path and format existing installs already have, and
+    get_or_create() reads through every backend first, so upgrading to a keychain
+    keeps the same public key and every past receipt still verifies. Returns a
+    sign_crypto.Signer, or None when the `cryptography` extra is absent (the
+    ledger then stays plain, fail-safe)."""
+    try:
+        from ...reality_compiler.sign_crypto import Signer
+    except Exception:
+        return None
+    if not getattr(Signer, "available", False):
+        return None
+    from ...secret_store import SecretStore
+    # prefer_keyring=False: the receipt seed must be STABLE across every reboot
+    # (a changed key orphans all past receipts), but a headless Brain has no
+    # interactively-unlocked OS keychain — a keychain locked at boot would report
+    # available then miss, and the store would mint a new seed. So the seed's
+    # durable home is the owner-only file (0o600 + ACL) or a registered enclave,
+    # not the keychain. The keychain backend stays available for interactive
+    # secrets that opt in with the default prefer_keyring=True.
+    store = SecretStore(cfg_dir, prefer_keyring=False)
+    key = store.get_or_create("receipt", lambda: os.urandom(32))
+    if len(key) < 32:                                # corrupt/short existing seed
+        key = os.urandom(32)
+        store.set("receipt", key)                    # set() cascades; never crashes
+    return Signer(key)
 
 
 def _restore_jsonl(path: Path, items) -> None:

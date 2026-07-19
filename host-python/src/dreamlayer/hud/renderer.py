@@ -28,6 +28,92 @@ def _ellipsize(text: str, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[: max_chars - 1] + "…"
 
 
+# ---------------------------------------------------------------------------
+# Juno, as pixels — the desk accessory earns her seat on the glass.
+# 32x32, quantized from landing/assets/juno/juno_icon32.png into three
+# palette levels: 1 outline, 2 body, 3 wings and highlights. Keep the
+# three copies in lockstep: here, halo-lua/display/renderer.lua
+# (JUNO_ROWS) and landing/assets/sim/halo-sim.js (JUNO_ROWS).
+# ---------------------------------------------------------------------------
+_JUNO_ROWS = (
+    ".......................1........",
+    "......................121.......",
+    ".................1221122........",
+    ".................1222322........",
+    "...............1.1232121........",
+    "..1221.......1222222212...1221..",
+    "..23332.....122233232....23332..",
+    "..1333331...122332212..2333331..",
+    "...2333332..12232211113333332...",
+    "...133333331.1232...233333331...",
+    "....133333332.22..1233333331....",
+    ".....1233333323322233333321.....",
+    ".......223332333322333322.......",
+    "..........222333232221..........",
+    ".......12232233323233221........",
+    ".....133333223331233333331......",
+    "....23333321233321333333332.....",
+    "....3333322.233331.23333333.....",
+    ".....22221.1333332...12222......",
+    "...........13333331.............",
+    "...........23233332.............",
+    "...........2223333321...........",
+    "...........222233333322.........",
+    "...........1222223333331........",
+    "............223222333333........",
+    "............122222133232........",
+    ".............222.2111.1.........",
+    "..............12222.............",
+    "...............2222.............",
+    "...............2211.............",
+    "...............11...............",
+    "................................",
+)
+
+
+def _juno_spans() -> list[tuple[int, int, int, int]]:
+    """Horizontal runs (y, x, width, level), built once at import."""
+    spans = []
+    for y, row in enumerate(_JUNO_ROWS):
+        x = 0
+        while x < len(row):
+            ch = row[x]
+            if ch == ".":
+                x += 1
+                continue
+            x2 = x
+            while x2 + 1 < len(row) and row[x2 + 1] == ch:
+                x2 += 1
+            spans.append((y, x, x2 - x + 1, int(ch)))
+            x = x2 + 1
+    return spans
+
+
+_JUNO_SPANS = _juno_spans()
+
+# Her liveries (level -> theme color). Veil drops the outline level:
+# gone dark, not re-lit.
+_JUNO_TEAL = {1: T.ACCENT_MEMORY_DIM, 2: T.ACCENT_MEMORY, 3: T.MEMORY_TRACE}
+_JUNO_SUCCESS = {1: T.ACCENT_SUCCESS_DIM, 2: T.ACCENT_SUCCESS, 3: T.ACCENT_SUCCESS}
+_JUNO_VEIL = {2: T.ACCENT_ATTENTION_DIM, 3: T.PRIVACY_DANGER}
+
+
+def draw_juno(draw, cx, cy, px, colors, alpha=255):
+    """Draw Juno centred on (cx, cy) at integer pixel scale `px` (pixel
+    art never tweens — scale in whole steps). `colors` maps level to a
+    theme color; a missing level is skipped."""
+    ox, oy = cx - 16 * px, cy - 16 * px
+    for y, x, w, level in _JUNO_SPANS:
+        color = colors.get(level)
+        if color is None:
+            continue
+        r_, g_, b_ = _hex_to_rgb(color)
+        draw.rectangle(
+            [ox + x * px, oy + y * px,
+             ox + (x + w) * px - 1, oy + (y + 1) * px - 1],
+            fill=(r_, g_, b_, alpha))
+
+
 def _font(size_token: str) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     px = FONT_PX.get(size_token, 13)
     candidates = [
@@ -156,6 +242,19 @@ def grad_line(draw, x0, y0, x1, y1, ramp=RAMP_MEMORY, stroke=1):
         nx, ny = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
         draw.line([(px, py), (nx, ny)], fill=_hex_to_rgb(color), width=stroke)
         px, py = nx, ny
+
+
+def pinstripe_rule(draw, x0, x1, y, alpha=150):
+    """The Platinum title-bar pinstripe, in the glass palette: three stacked
+    hairlines (bright -> mid -> dim teal). A quiet bridge to the panel's
+    pinstripe, drawn only in the eyebrow rule where it never meets body text
+    (mirrors the device Lua pinstripe_rule)."""
+    bands = ((0, T.MEMORY_TRACE, alpha),
+             (1, T.ACCENT_MEMORY, int(alpha * 0.7)),
+             (2, T.ACCENT_MEMORY_DIM, int(alpha * 0.5)))
+    for dy, color, a in bands:
+        r, g, b = _hex_to_rgb(color)
+        draw.line([(x0, y + dy), (x1, y + dy)], fill=(r, g, b, a), width=1)
 
 
 def grad_arc(draw, cx, cy, r, a0, a1, ramp=RAMP_MEMORY, steps=32, stroke=1):
@@ -533,27 +632,58 @@ class CardRenderer:
         draw.text((x, y), str(text), font=_font(size),
                   fill=(r, g, b, alpha), anchor=anchor)
 
-    def _multiline_text(self, draw, x, y, text, size, color, max_width=192):
+    def _multiline_text(self, draw, x, y, text, size, color, max_width=192,
+                        max_lines=8):
         font = _font(size)
+
+        def _w(s):
+            try:
+                return font.getlength(s)
+            except AttributeError:
+                return len(s) * FONT_PX.get(size, 13) * 0.6
+
         words = str(text).split()
         lines: list[str] = []
         current = ""
+        truncated = False
         for word in words:
+            # Hard-break a word too wide to fit on its own line, so a single
+            # unbroken run (an untrusted Juno/API-brain reply can be one) can't
+            # spill a 35000px band off the glass (audit 2026-07-15).
+            while _w(word) > max_width and len(word) > 1:
+                cut = len(word)
+                while cut > 1 and _w(word[:cut]) > max_width:
+                    cut -= 1
+                if current:
+                    lines.append(current); current = ""
+                lines.append(word[:cut]); word = word[cut:]
+                if len(lines) >= max_lines:
+                    break
+            if len(lines) >= max_lines:
+                truncated = True; break
             test = (current + " " + word).strip()
-            try:
-                w = font.getlength(test)
-            except AttributeError:
-                w = len(test) * FONT_PX.get(size, 13) * 0.6
-            if w <= max_width:
+            if _w(test) <= max_width:
                 current = test
             else:
                 if current:
                     lines.append(current)
                 current = word
-        if current:
+            if len(lines) >= max_lines:
+                truncated = True; break
+        if current and len(lines) < max_lines:
             lines.append(current)
+        elif current:
+            truncated = True
         if not lines:
             return
+        lines = lines[:max_lines]
+        if truncated:
+            # cap the card: an overlong reply can't garble the whole face — the
+            # last visible line ends in an ellipsis.
+            last = lines[-1]
+            while last and _w(last + "…") > max_width:
+                last = last[:-1]
+            lines[-1] = last + "…"
         line_h = FONT_PX.get(size, 13) + 5
         total_h = len(lines) * line_h
         start_y = y - total_h / 2 + line_h / 2
@@ -589,13 +719,8 @@ class CardRenderer:
     # ------------------------------------------------------------------
 
     def _ready(self, draw, card):
-        hex_pts = []
-        for i in range(6):
-            angle = math.radians(60 * i - 30)
-            hex_pts.append((CX + 8 * math.cos(angle), CY + 8 * math.sin(angle)))
-        hex_pts.append(hex_pts[0])
-        r_, g_, b_ = _hex_to_rgb(T.MEMORY_TRACE)
-        draw.polygon(hex_pts[:6], fill=(r_, g_, b_, 255))
+        # Juno at the core — the brain is listening, in person
+        draw_juno(draw, CX, CY, 1, _JUNO_TEAL)
         grad_arc(draw, CX, CY, 24, 180, 360, RAMP_MEMORY, 32)
         draw_elliptical_arc(draw, CX, CY, 36, 36, 0, 270, 1, T.MEMORY_TRACE, alpha=34)
         draw_elliptical_arc(draw, CX, CY, 48, 48, 270, 90, 1, T.MEMORY_TRACE, alpha=17)
@@ -660,8 +785,8 @@ class CardRenderer:
             alpha = 255 - ((i * 3) % n) * 18
             self._arc(draw, CX, CY, 40, a0, a0 + span - gap, 2,
                       T.MEMORY_TRACE, alpha=max(40, alpha))
-        self._dot(draw, CX, CY, 3, T.MEMORY_TRACE, alpha=255)
-        self._dot(draw, CX, CY, 6, T.MEMORY_TRACE, alpha=40)
+        # Juno at the still centre — the thought the chase circles around
+        draw_juno(draw, CX, CY, 1, _JUNO_TEAL)
 
     def _object_recall(self, draw, card):
         """Meridian Solid v3 — a spatial scene, not a text list.
@@ -758,8 +883,9 @@ class CardRenderer:
         lengths = [38.0, 52.0, 44.0, 30.0, 46.0]
         draw_radial_rays(draw, CX, CY - 10, 5, lengths,
                          T.MEMORY_TRACE, alpha=160, tip_bloom=True, stroke=1)
-        self._dot(draw, CX, CY - 10, 3, T.MEMORY_TRACE, alpha=200)
-        bloom_ring(draw, CX, CY - 10, 3, T.MEMORY_TRACE)
+        # the rays fan out from Juno — she is the one bringing the memory back
+        draw_juno(draw, CX, CY - 10, 1, _JUNO_TEAL)
+        bloom_ring(draw, CX, CY - 10, 15, T.MEMORY_TRACE)
         self._multiline_text(draw, CX, CY + 50, summary, "md", T.TEXT_SECONDARY, max_width=180)
         if person:
             self._text_rgba(draw, CX, CY + 78, f"With {person}",
@@ -778,6 +904,12 @@ class CardRenderer:
         conf     = card.get("confidence")
 
         glass_disc(draw, CX, 96, 56, PANE, 3)
+        # recognition jewel — concentric memory rings set the face the way
+        # saved_memory sets a save; knowing someone is a moment worth framing
+        for jr, jc in ((60, T.BORDER_SUBTLE), (54, T.ACCENT_MEMORY_DIM),
+                       (48, T.MEMORY_TRACE)):
+            self._arc(draw, CX, 84, jr, 0, 360, 1, jc, alpha=255)
+        bloom_ring(draw, CX, 84, 60, T.MEMORY_TRACE)
         self._circle(draw, CX, 84, 18, 1, T.BORDER_SUBTLE, alpha=255)
         bloom_ring(draw, CX, 84, 18, T.ACCENT_MEMORY_STATIC)
         draw_polar_segments(draw, CX, 84, 26, 44, 12, [0, 1, 2],
@@ -806,7 +938,8 @@ class CardRenderer:
     def _privacy_veil(self, draw, card):
         self._arc(draw, CX, CY, 108, 10, 350, 1, T.PRIVACY_DANGER, alpha=34)
         self._circle(draw, CX, CY, 88, 1, T.PRIVACY_DANGER, alpha=18)
-        draw_shield_glyph(draw, (CX, CY - 14), 52, 2, T.PRIVACY_DANGER, alpha=255, pause_bars=True)
+        # Juno goes dark: still with you, wings down, seeing nothing
+        draw_juno(draw, CX, CY - 14, 2, _JUNO_VEIL)
         self._text_rgba(draw, CX, CY + 32, "PRIVACY VEIL", "sm", T.PRIVACY_CAUTION, alpha=220)
         self._text_rgba(draw, CX, CY + 48, "Nothing is captured", "xs", T.TEXT_GHOST, alpha=140)
 
@@ -1126,12 +1259,13 @@ class CardRenderer:
         accent = T.ACCENT_SUCCESS if action else T.ACCENT_MEMORY
         body = str(card.get("primary") or "")
         self._pane(draw, 132, 78)
-        # eyebrow with a bloomed status dot
-        bloom_ring(draw, CX - 40, 64, 3, accent)
-        self._dot(draw, CX - 40, 64, 3, accent)
+        # the status dot grew wings: mini Juno signs her own card
+        draw_juno(draw, CX - 40, 62, 1,
+                  _JUNO_SUCCESS if action else _JUNO_TEAL)
+        bloom_ring(draw, CX - 40, 62, 15, accent)
         self._text_rgba(draw, CX + 6, 64, "JUNO",
                         "xs", accent, alpha=235)
-        grad_line(draw, 60, 82, 196, 82, RAMP_SUCCESS if action else RAMP_MEMORY)
+        pinstripe_rule(draw, 60, 196, 81)
         if len(body) <= 20:
             self._text(draw, CX, 132, body, self._fit(body, 200), T.TEXT_PRIMARY)
         else:
@@ -1145,13 +1279,14 @@ class CardRenderer:
         question = str(card.get("detail") or "")
         footer = str(card.get("footer") or "")
         self._pane(draw, 128, 78)
-        # dot sits clear of the 25-char eyebrow (its bloom was grazing the first
-        # glyph — the golden eyeball pass in #87; mirrors the Lua CX-88 nudge)
-        bloom_ring(draw, CX - 88, 70, 3, T.ACCENT_MEMORY)
-        self._dot(draw, CX - 88, 70, 3, T.ACCENT_MEMORY)
+        # mini-Juno sits clear of the 25-char eyebrow, where the dot did
+        # (the CX-88 nudge from the golden eyeball pass in #87 still applies):
+        # she's the one surfacing the answer, so she signs the card
+        draw_juno(draw, CX - 88, 70, 1, _JUNO_TEAL)
+        bloom_ring(draw, CX - 88, 70, 15, T.ACCENT_MEMORY)
         self._text_rgba(draw, CX + 4, 70, "ON THE TIP OF YOUR TONGUE",
                         "xs", T.ACCENT_MEMORY, alpha=225)
-        grad_line(draw, 52, 88, 204, 88, RAMP_MEMORY)
+        pinstripe_rule(draw, 52, 204, 87)
         self._text(draw, CX, 126, answer, self._fit(answer, 196), T.TEXT_PRIMARY)
         if question:
             self._text_rgba(draw, CX, 166, question, "sm",

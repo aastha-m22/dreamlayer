@@ -22,14 +22,21 @@ from __future__ import annotations
 import json
 import sys
 import threading
-import urllib.request
 from pathlib import Path
 
-from .menubar import DEFAULT_PORT, fetch_status, status_summary
+from .menubar import (DEFAULT_PORT, _authed_api, _TokenCache, check_for_update,
+                      fetch_status, status_summary)
 
 # the Run-key value name — the reversible unit --uninstall-login deletes
 RUN_VALUE = "DreamLayer"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+# What the Windows tray actually syncs. Contacts and Reminders are macOS-only
+# (the panel marks them unavailable on Windows), so the tray must NOT claim to
+# have synced them — only Calendar. The old toast said "Synced calendar,
+# contacts, reminders", which was dishonest on Windows (audit 2026-07-17).
+SYNC_ENDPOINTS = ("/dreamlayer/calendar/sync",)
+SYNC_TOAST = "Synced calendar"
 
 # traffic-light dot colors, keyed by the status_summary icon (same semantics
 # as the menu bar: green healthy, yellow cloud-unconfigured, shades for
@@ -79,12 +86,22 @@ def build_login_entry(directory: str | None = None, token: str = "",
 
     Bundled app (PyInstaller): the exe IS the appliance — server + tray in
     one process — so the entry is just the exe (plus --dir/--port when
-    non-default). Source install: mirror the macOS LaunchAgent exactly and
-    register the headless server. Binds 0.0.0.0 on purpose for the same
-    reason install_launch_agent does: the login entry IS the always-on
-    appliance the phone pairs with, so it must be LAN-reachable; safety
-    comes from the token (a non-loopback bind with no token mints one on
-    first run — server __main__).
+    non-default). Source install: register the headless server. Binds 0.0.0.0
+    on purpose for the same reason install_launch_agent does: the login entry
+    IS the always-on appliance the phone pairs with, so it must be
+    LAN-reachable.
+
+    The pairing token is NEVER put on this command line. An HKCU Run value is
+    readable by every process running as the user (Task Manager's command
+    column, ``reg query``, any ps-equivalent), so ``--token <secret>`` in the
+    entry leaked the pairing secret registry-/ps-visible. Instead the launched
+    server reads the token from the on-disk ``brain_config.json`` (0600-
+    equivalent), exactly like the macOS launch-agent fix — so the `token`
+    parameter is accepted for signature/API compatibility but deliberately not
+    emitted here (install_login_entry persists it to config instead). A
+    non-loopback bind with no persisted token still mints one on first run
+    (server __main__), so start-at-login keeps working either way (audit
+    2026-07-17).
     """
     if frozen is None:
         frozen = bool(getattr(sys, "frozen", False))
@@ -100,8 +117,7 @@ def build_login_entry(directory: str | None = None, token: str = "",
             "--host", "0.0.0.0", "--port", str(port)]
     if directory:
         args += ["--dir", directory]
-    if token:
-        args += ["--token", token]
+    # NB: no `--token` — see the docstring. The token lives in brain_config.json.
     return login_command(exe, args)
 
 
@@ -113,11 +129,36 @@ def install_login_entry(directory: str | None = None, token: str = "",
                         port: int = DEFAULT_PORT,
                         value_name: str = RUN_VALUE) -> str:
     """Write the HKCU Run entry so the Brain starts at login. Returns the
-    command written. Raises OSError off-Windows (there is no registry)."""
+    command written. Raises OSError off-Windows (there is no registry).
+
+    A supplied token is persisted to ``brain_config.json`` (the 0600-equivalent
+    on-disk config the launched server reads) rather than written onto the Run
+    command line, so the pairing secret never becomes registry-/ps-visible. The
+    command itself carries no token (see build_login_entry)."""
     if sys.platform != "win32":
         raise OSError("the HKCU Run registry exists only on Windows")
+    import os
     import winreg
-    cmd = build_login_entry(directory, token, port)
+    from .server.store import BrainConfig
+    if token:
+        # translate the old `--token <secret>` intent into config: the server
+        # this entry launches reads the token from disk, not from argv.
+        cfg_dir = directory or os.environ.get(
+            "DREAMLAYER_DIR", str(Path.home() / ".dreamlayer"))
+        cfg = BrainConfig.load(cfg_dir)
+        if cfg.token != token:
+            cfg.token = token
+            cfg.save(cfg_dir)
+        # Pin the login command to the SAME dir we just wrote the token to.
+        # build_login_entry omits --dir when directory is None, but cfg_dir was
+        # resolved from DREAMLAYER_DIR/default HERE; if that env var was set only
+        # in the install shell (not a persisted user var), the login server would
+        # re-resolve a DIFFERENT dir, find no token, and mint a fresh one —
+        # silently dropping the operator's token and breaking the paired phone.
+        # Passing the resolved dir makes install-time and login-time agree
+        # (refute 2026-07-17).
+        directory = cfg_dir
+    cmd = build_login_entry(directory, port=port)
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, cmd)
@@ -190,22 +231,29 @@ def run_tray(directory: str | None = None, port: int = DEFAULT_PORT) -> int:
     from .server.store import BrainConfig
     cfg_dir = directory or os.environ.get(
         "DREAMLAYER_DIR", str(Path.home() / ".dreamlayer"))
-    token = BrainConfig.load(cfg_dir).token
+    auth = _TokenCache(cfg_dir, BrainConfig.load)
+
+    def _token():
+        # Re-read from config if the cache is empty. On a slow first run the
+        # server mints/persists the token just after the UI started, and a cached
+        # empty token would leave the dot permanently grey (authorize needs the
+        # exact token even from loopback). An auth failure in _api() also clears
+        # the cache, so this re-reads a ROTATED token without a restart.
+        return auth.get()
 
     state: dict = {"summary": status_summary(None), "incognito": False}
 
     def _api(path, method="GET", body=b"{}"):
-        url = f"http://127.0.0.1:{port}{path}"
-        headers = {"X-DreamLayer-Token": token, "Content-Type": "application/json"}
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        req = urllib.request.Request(url, headers=headers,
-                                     data=(body if method == "POST" else None),
-                                     method=method)
-        with opener.open(req, timeout=6) as r:
-            return json.loads(r.read().decode("utf-8"))
+        # _authed_api carries the cached token and, on a 401/403, invalidates the
+        # cache so the next _token() re-reads a rotated token from config.
+        return _authed_api(port, auth, path, method, body)
 
     def refresh(icon):
-        st = fetch_status(port, token)
+        # Route the passive poll through the auth-aware fetch_status: a 401/403
+        # invalidates the cache so the NEXT tick re-reads a rotated token from
+        # config and the dot self-heals — no user action needed (same contract
+        # as the macOS menu bar; fetch_status is the shared helper).
+        st = fetch_status(port, _token(), auth=auth)
         state["summary"] = status_summary(st)
         state["incognito"] = bool((st or {}).get("incognito"))
         icon.icon = _dot_image(dot_color(state["summary"]))
@@ -224,17 +272,38 @@ def run_tray(directory: str | None = None, port: int = DEFAULT_PORT) -> int:
         webbrowser.open(url)
 
     def sync_now(icon, item):
-        for ep in ("/dreamlayer/calendar/sync", "/dreamlayer/contacts/sync",
-                   "/dreamlayer/reminders/sync"):
+        # Only what Windows actually syncs — Calendar. Contacts/Reminders are
+        # macOS-only, so the toast must not claim them (SYNC_ENDPOINTS/SYNC_TOAST).
+        for ep in SYNC_ENDPOINTS:
             try:
                 _api(ep, "POST")
             except Exception:
                 pass
         try:
-            icon.notify("Synced calendar, contacts, reminders", "DreamLayer")
+            icon.notify(SYNC_TOAST, "DreamLayer")
         except Exception:
             pass
         refresh(icon)
+
+    def check_updates(icon, item):
+        # Click-only: the network fetch runs ONLY here, never on the refresh
+        # loop. Offline/error degrades to a "couldn't check" toast. Run it OFF
+        # the message-loop thread — pystray invokes menu callbacks on the thread
+        # pumping the loop, so a slow/timing-out fetch would freeze the tray for
+        # up to the fetch timeout per click (same fix as the macOS menu bar;
+        # audit 2026-07-17).
+        def _work():
+            res = check_for_update()
+            try:
+                icon.notify(res["message"], "DreamLayer")
+            except Exception:
+                pass
+            if res["status"] == "update":
+                try:
+                    webbrowser.open(res["url"])
+                except Exception:
+                    pass
+        threading.Thread(target=_work, daemon=True).start()
 
     def toggle_incognito(icon, item):
         want = not state["incognito"]
@@ -259,6 +328,8 @@ def run_tray(directory: str | None = None, port: int = DEFAULT_PORT) -> int:
         MenuItem("Sync now", sync_now),
         MenuItem("Incognito", toggle_incognito,
                  checked=lambda item: state["incognito"]),
+        Menu.SEPARATOR,
+        MenuItem("Check for updates", check_updates),
         Menu.SEPARATOR,
         MenuItem(lambda item: state["summary"]["lines"][0], None, enabled=False),
         Menu.SEPARATOR,

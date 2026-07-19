@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 
 from .embeddings import MockEmbeddingProvider, cosine, unpack_embedding
+from .retrieval import HIDDEN_KINDS   # shared: kinds a kind=None recall hides
 
 log = logging.getLogger("dreamlayer.vector_store")
 
@@ -59,8 +60,12 @@ class VectorStore:
         qv = self.embedder.embed(query)
         scored = []
         for m in self.db.memories(kind=kind):
+            if kind is None and m.get("kind") in HIDDEN_KINDS:
+                continue                          # bookmarks aren't recall answers
             sim = cosine(qv, self._emb_of(m))
-            score = 0.5 * sim + 0.5 * (m.get("confidence") or 0.5)
+            conf = m.get("confidence")
+            conf = 0.5 if conf is None else float(conf)   # explicit 0.0 stays 0.0
+            score = 0.5 * sim + 0.5 * conf
             scored.append((score, m))
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[:top_k]
@@ -123,6 +128,21 @@ class VectorStore:
                     (mid, m.get("kind") or "", sqlite_vec.serialize_float32(emb)))
             self._indexed_ids.add(mid)
 
+    def _table_ready(self) -> bool:
+        """True once the vec0 table has actually been created (first search).
+        evict/purge_all can fire BEFORE any search — a "forget that" issued the
+        moment this store is enabled — when memory_vec does not yet exist. A
+        bare ``DELETE FROM memory_vec`` then raises OperationalError('no such
+        table'), which propagates out of Retriever.purge_memory and SKIPS the
+        downstream bias discard, so forget silently leaves a rank-ghost behind
+        (audit 2026-07-17). A missing table means nothing is indexed yet, so
+        forget is simply an empty no-op."""
+        with self.db._lock:
+            row = self.db.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='memory_vec'").fetchone()
+        return row is not None
+
     def evict(self, memory_id: int) -> None:
         """Drop a purged memory's vector so it can never be recalled again and
         never occupies a top-k slot. Without this the vec table only ever grew:
@@ -132,12 +152,12 @@ class VectorStore:
         Wired into Retriever.purge_memory (audit 2026-07-14): "forget that" must
         reach this table too — it lives inside db.conn, which the DB-level purge
         never touched, so a forgotten memory left a fully recallable embedding
-        the moment this store was enabled."""
-        if not self._ensure_loaded():
-            return
-        with self.db._lock:
-            self.db.conn.execute(
-                "DELETE FROM memory_vec WHERE memory_id=?", (memory_id,))
+        the moment this store was enabled. Tolerates a not-yet-created table
+        (forget before the first search) so it never raises into purge_memory."""
+        if self._ensure_loaded() and self._table_ready():
+            with self.db._lock:
+                self.db.conn.execute(
+                    "DELETE FROM memory_vec WHERE memory_id=?", (memory_id,))
         self._indexed_ids.discard(memory_id)
 
     def purge_all(self) -> None:
@@ -145,11 +165,11 @@ class VectorStore:
         Retriever.purge_all. memory_vec lives in db.conn but is NOT one of the
         tables db.purge_all() deletes, so without this an erase left every
         embedding behind (a privacy residue) the moment this store was enabled.
-        No-op when the extension never loaded (table was never created)."""
-        if not self._ensure_loaded():
-            return
-        with self.db._lock:
-            self.db.conn.execute("DELETE FROM memory_vec")
+        No-op when the extension never loaded, or before the first search built
+        the table — an erase-before-search must not raise into purge_all."""
+        if self._ensure_loaded() and self._table_ready():
+            with self.db._lock:
+                self.db.conn.execute("DELETE FROM memory_vec")
         self._indexed_ids.clear()
 
     def _search_indexed(self, query, kind, top_k):
@@ -169,12 +189,18 @@ class VectorStore:
         # Over-fetch so stale rows (a memory purged from the DB but not yet
         # evicted here) can't starve the result below top_k — we refill from
         # the wider candidate set, keeping "results are always correct" true
-        # even if a caller forgot to evict().
+        # even if a caller forgot to evict(). Bound via the `k = ?` constraint
+        # form (not `LIMIT ?`): a vec0 knn query requires ONE of the two, and
+        # only `k = ?` reliably pushes down to the virtual table on every
+        # SQLite build — `LIMIT ?` needs a SQLite new enough to push LIMIT
+        # into a virtual table, which older builds (e.g. 3.34.1) cannot do,
+        # silently degrading search() to the linear scan instead (#429).
+        where += " AND k = ?"
         params.append(max(top_k * 4, 16))
         with self.db._lock:
             cur = self.db.conn.execute(
                 f"SELECT memory_id, distance FROM memory_vec WHERE {where} "
-                "ORDER BY distance LIMIT ?", params)
+                "ORDER BY distance", params)
             rows = cur.fetchall()
         out = []
         for mid, dist in rows:
@@ -183,6 +209,8 @@ class VectorStore:
                 m = next((x for x in self.db.memories() if x["id"] == mid), None)
             if m is None:
                 continue           # dead row (purged) — skip, don't count it
+            if kind is None and m.get("kind") in HIDDEN_KINDS:
+                continue           # hidden bookmark — mirror the linear reference
             sim = 1.0 - float(dist)      # cosine distance → cosine similarity
             conf = m.get("confidence")
             conf = 0.5 if conf is None else float(conf)   # 0.0 stays 0.0

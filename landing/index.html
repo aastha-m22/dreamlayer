@@ -408,7 +408,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .hero-vignette{position:absolute;inset:0;pointer-events:none;
   background:radial-gradient(115% 90% at 50% 44%,transparent 34%,rgba(0,0,0,.72) 82%,#000 100%)}
 .hero .hero-juno{position:absolute;z-index:1;pointer-events:none;
-  left:44%;top:41%;width:clamp(300px,42%,540px);
+  left:44%;top:37%;width:clamp(300px,42%,540px);
   transform:translate(-50%,-50%) translate3d(var(--jpx,0px),var(--jpy,0px),0)}
 .hero .hero-juno::before{content:"";position:absolute;left:50%;top:52%;width:66%;height:82%;
   transform:translate(-50%,-50%);border-radius:50%;z-index:-1;
@@ -433,7 +433,10 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   50%{opacity:.9;transform:translate(-50%,-50%) scale(1.08)}}
 @keyframes junoFloatLite{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
 .hero-core{position:relative;z-index:2;text-align:center;padding:9svh var(--gutter) 8svh;
-  will-change:transform,opacity}
+  will-change:transform,opacity;
+  /* a dark halo so the copy stays legible where it crosses Juno's glow */
+  text-shadow:0 1px 2px rgba(0,0,0,.9),0 0 18px rgba(0,0,0,.55)}
+.hero-core .pbtn{text-shadow:none}
 .hero-glass{position:relative;width:clamp(130px,17svh,170px);height:clamp(130px,17svh,170px);
   margin:0 auto 30px;border-radius:50%}
 .hero-glass canvas{position:relative;z-index:1;width:100%;height:100%;display:block;border-radius:50%;
@@ -473,6 +476,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
   border-radius:50%;animation:ringbreathe var(--breath) ease-in-out infinite}
 .scope.alert .breath-ring{border-color:rgba(224,107,82,.4)}
 .scope .tick{position:absolute;top:4%;left:calc(50% - 1px);width:2px;height:3.5%;background:var(--h-teal)}
+.scope-glass{position:absolute;inset:0;z-index:1;width:100%;height:100%;border-radius:50%;display:block}
 @keyframes ringbreathe{0%,100%{transform:scale(1);opacity:.30}50%{transform:scale(1.18);opacity:.08}}
 .lens-world{position:absolute;inset:0;z-index:0;border-radius:50%;overflow:hidden;pointer-events:none;
   background:#0a1216 center/cover no-repeat;filter:brightness(.6) saturate(1.0);
@@ -863,7 +867,7 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
 @media (max-width:900px){
   :root{--tbh:24px}
   .deskicons{display:none}
-  .mw{width:calc(100vw - 16px);margin:7svh auto}
+  .mw{width:calc(100vw - 16px);margin:32px auto}
   .mw.tilt-l,.mw.tilt-r{translate:none}
   .lens-grid{grid-template-columns:repeat(2,1fr)}
   .vid-grid{grid-template-columns:1fr;max-width:420px;margin:0 auto}
@@ -875,7 +879,21 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
   .tier .rail{left:6px;top:24px;bottom:6px;right:auto;width:2px;height:auto}
   .tier .rail i::after{transform:scaleY(0);transform-origin:top}
   .tier.lit .rail i::after{transform:scaleY(1)}
-  .hero .hero-juno{width:min(78%,400px);top:35%}
+  /* the window is its own height — no forced 100svh, so the first scroll
+     goes straight to the next window instead of through empty desktop.
+     And the first screen must not breathe with the browser chrome: iOS
+     browsers re-evaluate viewport units when the URL bar collapses
+     mid-scroll (Brave treats svh as live), which visibly stretched the
+     hero window. Up here it's fixed px only. */
+  .hero{min-height:auto;padding:14px 0 24px}
+  .hero-screen{min-height:0}
+  .hero-core{padding:54px var(--gutter) 46px}
+  .hero-cta{margin-top:26px}
+  .sec-head{margin-bottom:34px}
+  .story-steps{padding:0 0 26px}
+  /* Juno steps aside on small screens — off to the window's right edge,
+     a little smaller and dimmer, so the copy never sits on her dress */
+  .hero .hero-juno{width:min(46%,240px);left:77%;top:22%;opacity:.82}
   .hero .hero-juno video,.hero .hero-juno img{animation:junoFloatLite 9s ease-in-out infinite}
   .can-head{flex-direction:column;align-items:flex-start}
   .hud-float{width:148px;margin:6px auto 0}
@@ -977,6 +995,7 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
   <button class="deskpick" data-pic="pattern"><span class="chk"></span>Platinum Pattern</button>
   <hr>
   <a href="https://github.com/LetsGetToWorkBro/dreamlayer/releases/latest/download/DreamLayer.dmg">Download for Mac <span class="mdim">.dmg</span></a>
+  <a href="https://github.com/LetsGetToWorkBro/dreamlayer/releases/latest/download/DreamLayer-Setup.exe">Download for Windows <span class="mdim">.exe</span></a>
   <a href="https://github.com/LetsGetToWorkBro/dreamlayer" target="_blank" rel="noopener">GitHub <span class="mdim">↗</span></a>
   <a href="https://letsgettoworkbro.github.io/dreamlayer-docs/" target="_blank" rel="noopener">Knowledge Base <span class="mdim">↗</span></a>
   <a href="https://x.com/dr3amlayer" target="_blank" rel="noopener">𝕏 / Twitter <span class="mdim">↗</span></a>
@@ -1160,53 +1179,9 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
             <div class="lens-world" data-w="scope" aria-hidden="true"></div>
             <span class="breath-ring"></span>
             <span class="tick"></span>
-
-            <div class="hud-card" data-card="0">
-              <div class="h-pane"></div>
-              <div class="h-glyph"></div>
-              <div class="h-eyebrow">Juno</div>
-              <div class="h-title">Snake plant</div>
-              <div class="h-cap">water every 2 weeks</div>
-              <div class="h-ghost">last done · Tuesday</div>
-              <div class="h-dot"></div>
-            </div>
-
-            <div class="hud-card" data-card="1">
-              <div class="h-pane"></div>
-              <div class="h-iris">M</div>
-              <div class="h-eyebrow">Introduction</div>
-              <div class="h-title">“Hi, I’m Maya.”</div>
-              <div class="h-cap">Maya · kept</div>
-              <div class="h-ghost">she introduced herself · never strangers</div>
-              <div class="h-dot"></div>
-            </div>
-
-            <div class="hud-card" data-card="2">
-              <div class="h-pane"></div>
-              <div class="h-eyebrow">Lucid Recall</div>
-              <div class="h-title">North rack<br>4th &amp; Alder</div>
-              <div class="h-cap">your bike</div>
-              <div class="h-ghost">seen 8:12 AM · confidence high</div>
-              <div class="h-dot"></div>
-            </div>
-
-            <div class="hud-card coral" data-card="3">
-              <div class="h-rail"></div>
-              <div class="h-eyebrow">Drift detected</div>
-              <div class="h-title">Send the lease</div>
-              <div class="h-cap">→ Marcus</div>
-              <div class="h-ghost">Friday before noon</div>
-              <div class="h-dot"></div>
-            </div>
-
-            <div class="hud-card" data-card="4">
-              <div class="h-pane"></div>
-              <div class="h-eyebrow">Rosetta · ES → EN</div>
-              <div class="h-title">“Grilled octopus,<br>house lemon.”</div>
-              <div class="h-cap">read back in yours</div>
-              <div class="h-ghost">live · on device</div>
-              <div class="h-dot"></div>
-            </div>
+            <!-- The flagship lens now runs the true renderer (halo-sim.js): each
+                 scroll step plays that lens's real intro animation, not a fade. -->
+            <canvas class="scope-glass" id="scopeGlass" aria-hidden="true"></canvas>
           </div>
         </div>
       </div>
@@ -1659,9 +1634,10 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
     <div class="sec-head">
       <span class="eyebrow arrive">The software you run</span>
       <h2 class="headline arrive" style="--d:80ms">Two apps you can run today.</h2>
-      <p class="body arrive" style="--d:160ms">Both testable now, before the glasses ship. The iOS
-        app pairs your devices and puts your brain in your pocket; the Mac app turns a spare Mac mini
-        into a private knowledge node on your own network.</p>
+      <p class="body arrive" style="--d:160ms">Both testable now, before the glasses ship. The phone
+        app — built for iOS <em>and</em> Android — pairs your devices and puts your brain in your
+        pocket; the Brain app turns a spare Mac or Windows PC into a private knowledge node on your
+        own network.</p>
     </div>
 
     <div class="sw-grid">
@@ -1669,16 +1645,17 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
         <div class="sw-frame">
           <div class="phone-stack">
             <div class="phone back" aria-hidden="true"><div class="scr"><img loading="lazy"
-                 src="assets/software/phone_memories.png" alt=""></div></div>
+                 src="assets/software/phone_brain.png" alt=""></div></div>
             <div class="phone"><div class="scr"><img loading="lazy"
-                 src="assets/software/phone_brain.png" alt="The DreamLayer iOS app, Brain tab"></div></div>
+                 src="assets/software/phone_now.png" alt="The DreamLayer phone app — the Now dashboard, in the Platinum design"></div></div>
           </div>
         </div>
         <div class="sw-cap">
-          <span class="eyebrow">iOS app</span>
+          <span class="eyebrow">iOS &amp; Android</span>
           <h3>Your brain, in your pocket</h3>
           <p>Pair the trio with one code and own your privacy from a single screen — phone-first,
-            cloud a switch you hold.</p>
+            cloud a switch you hold. One codebase, both platforms; not on the App&nbsp;Store or
+            Play yet — early access gets it first.</p>
           <ul class="sw-feats">
             <li><b>Ask from anywhere.</b> “What does Marcus owe me?” answered from your own memory,
               not a search box.</li>
@@ -1701,18 +1678,23 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
           </div>
         </div>
         <div class="sw-cap">
-          <span class="eyebrow">macOS · the Brain</span>
+          <span class="eyebrow">Mac &amp; Windows · the Brain</span>
           <h3>A private knowledge node</h3>
-          <p>Point it at a spare Mac and it becomes the smart, private half of your brain — indexing
-            your world and serving it back, all on your own network.</p>
+          <p>Point it at a spare Mac or Windows PC and it becomes the smart, private half of your
+            brain — indexing your world and serving it back, all on your own network.</p>
           <ul class="sw-feats">
             <li><b>Morning brief.</b> One tap synthesises what’s new and what’s on you — across your
               messages, mail, and everything you’re tracking.</li>
             <li><b>Knows your day &amp; your people.</b> Reads macOS Calendar, Contacts, and Reminders
-              so the glasses greet who you’ve met and surface what’s due — read-only, nothing leaves.</li>
+              — on Windows, Thunderbird mail and .ics calendars — so the glasses greet who you’ve met
+              and surface what’s due. Read-only, nothing leaves.</li>
             <li><b>Answers from your files.</b> Index chosen folders and mail; keyword search needs
               zero setup, and a local model adds written answers and vision — no cloud required.</li>
           </ul>
+          <div class="cta-row" style="margin-top:14px">
+            <a class="pbtn" href="https://github.com/LetsGetToWorkBro/dreamlayer/releases/latest/download/DreamLayer.dmg">Download for Mac</a>
+            <a class="pbtn" href="https://github.com/LetsGetToWorkBro/dreamlayer/releases/latest/download/DreamLayer-Setup.exe">Download for Windows</a>
+          </div>
         </div>
       </div>
     </div>
@@ -1843,14 +1825,18 @@ footer{margin:9svh 0 0;background:var(--plat);border-top:1px solid var(--frame);
 
     <div class="getapp arrive" style="--d:150ms">
       <div class="g-copy">
-        <span class="k">No terminal — get the Mac app</span>
-        <p>The same Orchestrator + Figment stage, packaged as a signed, notarized menu-bar
-          appliance. Double-click the&nbsp;.dmg, drag DreamLayer to Applications, and it lives in
-          your menu bar.</p>
+        <span class="k">No terminal — get the Brain app</span>
+        <p>The same Orchestrator + Figment stage, packaged for both desks: a signed, notarized
+          menu-bar appliance on the Mac, and a system-tray appliance with a per-user installer on
+          Windows. Same panel, same privacy.</p>
       </div>
       <a class="pbtn go dl" href="https://github.com/LetsGetToWorkBro/dreamlayer/releases/latest/download/DreamLayer.dmg">
         Download for Mac ↓
         <small>Apple&nbsp;Silicon · notarized</small>
+      </a>
+      <a class="pbtn go dl" href="https://github.com/LetsGetToWorkBro/dreamlayer/releases/latest/download/DreamLayer-Setup.exe">
+        Download for Windows ↓
+        <small>per-user installer · no admin</small>
       </a>
     </div>
 
@@ -2194,11 +2180,11 @@ document.querySelectorAll(".arrive").forEach(function(el){ io.observe(el); });
 
 /* ---------- sticky story ---------- */
 var scope=document.getElementById("scope");
-var cards=[].slice.call(document.querySelectorAll("#scope .hud-card"));
 var steps=[].slice.call(document.querySelectorAll(".step"));
 function setCard(i){
-  cards.forEach(function(c,j){ c.classList.toggle("active",j===i); });
-  scope.classList.toggle("alert",i===3);
+  scope.classList.toggle("alert",i===3);           // coral breath-ring on the Keep step
+  window.__scopeI=i;                               // remembered for a late-mounting glass
+  if(window.__scopeShow) window.__scopeShow(i);    // play that lens's true intro
 }
 var stepIO=new IntersectionObserver(function(entries){
   entries.forEach(function(e){
@@ -2208,12 +2194,19 @@ var stepIO=new IntersectionObserver(function(entries){
 steps.forEach(function(s){ stepIO.observe(s); });
 setCard(0);
 
-/* ---------- marquee: the real HUD frames, doubled for the loop ---------- */
-var mqImgs=["ready","listening","saved_memory","object_recall","person_context_v2",
-  "juno_reply","hark","answer_ahead","fact_check","morning_brief","person_dossier",
-  "spoken_caption","truth_gauge","commitment_drift","privacy_veil","world_anchor"];
+/* ---------- marquee: the real HUD frames, doubled for the loop ----------
+   The full current card library, narrative order: wake → the World lenses
+   (Scholar, chooser, Taste, Juno, Waypath) → memory → people → speech →
+   truth → time → Ember → Synesthesia → anchor → the Veil closes the reel. */
+var mqImgs=["ready","listening","juno_reply","hark","answer_ahead",
+  "scholar_answer","glance_choice","taste","object_recall","waypath",
+  "saved_memory","proactive_memory","commitment_recall","commitment_drift",
+  "morning_brief","person_context_v2","person_dossier","spoken_caption",
+  "live_caption","fact_check","truth_gauge","deviation_alert",
+  "time_scrub_node","ember_flare","synesthesia_v2","world_anchor","privacy_veil"];
 var track=document.getElementById("mqTrack");
 if(track){
+  track.style.animationDuration=(mqImgs.length*3.75)+"s";  // constant px/sec at any length
   var html="";
   mqImgs.concat(mqImgs).forEach(function(n){
     html+='<img loading="lazy" src="assets/hud/'+n+'.png" alt="" width="256" height="256">';
@@ -2559,18 +2552,16 @@ window.__applyVeil=applyVeil;
 
 /* ---------- mobile: give each story step its own inline circle ---------- */
 (function(){
-  var scopeEl=document.getElementById("scope");
-  if(!scopeEl) return;
+  if(!document.getElementById("scope")) return;
   document.querySelectorAll(".step").forEach(function(step){
     var i=+step.dataset.step;
-    var mini=scopeEl.cloneNode(true);
-    mini.removeAttribute("id");
-    mini.classList.add("mini");
-    if(i===3) mini.classList.add("alert");
-    mini.querySelectorAll(".hud-card").forEach(function(c){
-      if(+c.dataset.card===i) c.classList.add("active");
-      else c.remove();
-    });
+    var mini=document.createElement("div");
+    mini.className="scope mini"+(i===3?" alert":"");
+    mini.setAttribute("aria-hidden","true");
+    var lw=document.createElement("div"); lw.className="lens-world"; lw.setAttribute("data-w","scope"); mini.appendChild(lw);
+    var br=document.createElement("span"); br.className="breath-ring"; mini.appendChild(br);
+    var cv=document.createElement("canvas"); cv.className="scope-glass";
+    cv.setAttribute("data-lens",String(i)); cv.setAttribute("aria-hidden","true"); mini.appendChild(cv);
     var wrap=document.createElement("div");
     wrap.className="step-hud"; wrap.setAttribute("aria-hidden","true");
     wrap.appendChild(mini);
@@ -2645,6 +2636,35 @@ window.__applyVeil=applyVeil;
         [4600, function(){ h.sim.card=null; h.sim.people=[]; h.sim._faceOf={}; }],
       ]; }
     });
+
+    /* ---- the flagship scope + mobile minis: the true renderer, per step.
+       Each scroll step plays that lens's real intro (fly-in / bloom / drift),
+       so the homepage's centerpiece IS the product renderer. ---- */
+    var LENS=[
+      ["object",  {eyebrow:"JUNO",             title:"Snake plant",                 cap:"water every 2 weeks", ghost:"last done · Tuesday"}],
+      ["intro",   {eyebrow:"INTRODUCTION",     title:"“Hi, I’m Maya.”", initial:"M",cap:"Maya · kept",        ghost:"introduced herself · kept"}],
+      ["waypath", {eyebrow:"LUCID RECALL",     title:"North rack 4th & Alder",      cap:"your bike",           ghost:"seen 8:12 AM · high"}],
+      ["keep",    {eyebrow:"DRIFT DETECTED",   title:"Send the lease",              cap:"→ Marcus",            ghost:"Friday before noon"}],
+      ["rosetta", {eyebrow:"ROSETTA · ES → EN",title:"“Grilled octopus, house lemon.”",cap:"read back in yours",ghost:"live · on device"}]
+    ];
+    function mountScope(canvas){
+      var sim=new Halo.Sim(), g=new Halo.Glass(canvas, sim); g.bgAlpha=0.5; g._cur=-1;
+      if(!reduced) g.start();
+      return function(i){ if(i===g._cur||!LENS[i]) return; g._cur=i;
+        g.show(LENS[i][0], LENS[i][1], reduced); if(reduced) g.render(); };
+    }
+    var sg=document.getElementById("scopeGlass");
+    if(sg){ window.__scopeShow=mountScope(sg);
+      window.__scopeShow(window.__scopeI!=null?window.__scopeI:0); }
+    var minis=[].slice.call(document.querySelectorAll(".step-hud canvas.scope-glass"));
+    if(minis.length){
+      var mIO=new IntersectionObserver(function(es){ es.forEach(function(e){
+        if(!e.isIntersecting) return;
+        if(!e.target.__show) e.target.__show=mountScope(e.target);
+        e.target.__show(+e.target.dataset.lens);
+      });},{threshold:0.4});
+      minis.forEach(function(c){ mIO.observe(c); });
+    }
   }
   if(document.readyState==="loading") document.addEventListener("DOMContentLoaded",boot); else boot();
 })();
@@ -2660,11 +2680,20 @@ var reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /* ---------- zoom-rects: the Finder's opening animation ---------- */
 var zfx=document.getElementById("zoomfx"), zctx=zfx.getContext("2d");
+var _zw=0,_zh=0,_zd=0;
 function zsize(){ var d=Math.min(devicePixelRatio||1,2);
-  zfx.width=innerWidth*d; zfx.height=innerHeight*d; zctx.setTransform(d,0,0,d,0,0); }
-zsize(); addEventListener("resize",zsize,{passive:true});
+  if(innerWidth===_zw && innerHeight===_zh && d===_zd) return;
+  _zw=innerWidth; _zh=innerHeight; _zd=d;
+  zfx.width=_zw*d; zfx.height=_zh*d; zctx.setTransform(d,0,0,d,0,0); }
+zsize();
+/* width/DPR changes re-size eagerly. A height-only resize — the mobile URL
+   bar collapsing on the first scroll — must NOT: reallocating a full-screen
+   canvas right then is a guaranteed dropped frame. zoomRects trues the
+   height up lazily the next time it actually draws. */
+addEventListener("resize",function(){ if(innerWidth!==_zw||Math.min(devicePixelRatio||1,2)!==_zd) zsize(); },{passive:true});
 function zoomRects(from,to,done,ms){
   if(reduced){ if(done) done(); return; }
+  zsize();
   ms=ms||320;
   var t0=performance.now(), STEPS=12;
   function draw(now){
@@ -2736,8 +2765,12 @@ function finishBoot(fast){
   setTimeout(function(){ finishBoot(false); }, 2150);
 })();
 
-/* the rest of the windows open as they scroll in */
-var openIO=("IntersectionObserver" in window) ? new IntersectionObserver(function(es){
+/* the rest of the windows open as they scroll in — a desktop pleasure.
+   On phones the zoom-rect + stepped pop lands mid-scroll and reads as
+   chop (and as blank desktop until it fires), so there the windows are
+   simply already open and the first scroll stays calm. */
+var zoomOpens = matchMedia("(min-width:901px)").matches;
+var openIO=(zoomOpens && "IntersectionObserver" in window) ? new IntersectionObserver(function(es){
   es.forEach(function(e){ if(e.isIntersecting){ openWindow(e.target); openIO.unobserve(e.target); } });
 },{rootMargin:"0px 0px -6% 0px",threshold:0.03}) : null;
 topWins.forEach(function(w){ if(w!==heroWin){ if(openIO) openIO.observe(w); else w.classList.add("open"); } });
@@ -2984,9 +3017,15 @@ function initScroll(){
         });
       });
     }
-    ST.create({ trigger:"#top", start:"top top", end:"bottom top", scrub:true,
-      onUpdate:function(self){ applyHero(self.progress); } });
     var mm=G.matchMedia();
+    /* the hero parallax is a desktop pleasure — scrubbed transforms fight
+       native touch momentum on phones and read as chop, so below 761px the
+       first scroll stays a plain scroll */
+    mm.add("(min-width:761px)", function(){
+      var t=ST.create({ trigger:"#top", start:"top top", end:"bottom top", scrub:true,
+        onUpdate:function(self){ applyHero(self.progress); } });
+      return function(){ t.kill(); applyHero(0); };
+    });
     mm.add("(min-width:761px)", function(){
       var t=ST.create({ trigger:"#veil", start:"top top", end:"bottom bottom", scrub:true,
         onUpdate:function(self){ applyVeilSafe(self.progress); } });
@@ -3012,7 +3051,7 @@ function initScroll(){
       requestAnimationFrame(function(){
         ticking=false;
         var y=scrollY, vh=innerHeight;
-        if(!reduced) applyHero(Math.min(1,y/(vh*0.9)));
+        if(!reduced && innerWidth>760) applyHero(Math.min(1,y/(vh*0.9)));
         applyVeilSafe();
       });
     }
